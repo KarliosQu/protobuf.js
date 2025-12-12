@@ -1,0 +1,43 @@
+{
+  "name": "protobufjs-napi",
+  "version": "0.1.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "protobufjs-napi",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "i686-pc-windows-msvc",
+        "armv7-unknown-linux-gnueabihf",
+        "aarch64-apple-darwin",
+        "aarch64-linux-android",
+        "x86_64-unknown-freebsd",
+        "aarch64-unknown-linux-musl",
+        "aarch64-pc-windows-msvc",
+        "armv7-linux-androideabi"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "cd ../protobuf.js-protobufjs-v7.2.4 && node node_modules/tape/bin/tape -r ./lib/tape-adapter -r ../rprotobuf/scripts/test-patch.js tests/*.js tests/node/*.js",
+    "prepublishOnly": "napi prepublish -t npm",
+    "artifacts": "napi artifacts",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "glob": "^13.0.0",
+    "tape": "^5.9.0"
+  },
+  "engines": {
+    "node": ">= 10"
+  },
+  "dependencies": {
+    "protobufjs": "^7.5.4"
+  }
+}
