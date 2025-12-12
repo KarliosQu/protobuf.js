@@ -412,7 +412,7 @@ Reader._configure = function(BufferReader_) {
 
 try {
     if (!process.env.DISABLE_RUST) {
-        var rust = require("../../rprotobuf");
+        var rust = require("../rprotobuf");
         if (rust.Reader) {
             var RustReader = rust.Reader;
             

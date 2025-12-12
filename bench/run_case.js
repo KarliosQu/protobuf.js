@@ -8,9 +8,9 @@ const targetSize = parseInt(process.argv[3]);
 let protobuf;
 try {
     if (mode === 'native') {
-        protobuf = require("../../rprotobuf/integration_native.js");
+        protobuf = require("../rprotobuf/integration_native.js");
     } else {
-        protobuf = require("../../rprotobuf/integration.js");
+        protobuf = require("../rprotobuf/integration.js");
     }
 } catch (e) {
     console.error("Failed to load protobuf integration:", e);

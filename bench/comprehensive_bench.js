@@ -2,7 +2,7 @@
 
 var newSuite = require("./suite");
 var protobuf = require("..");
-var rprotobuf = require("../../rprotobuf");
+var rprotobuf = require("../rprotobuf");
 var { NativeMessage, NativeType, Writer, ManagedMessage } = rprotobuf;
 
 // --- Setup Schemas ---

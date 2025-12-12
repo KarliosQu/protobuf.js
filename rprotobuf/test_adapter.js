@@ -1,6 +1,6 @@
 const { fromObject, toObject } = require('./adapter');
 const { ManagedMessage } = require('./index');
-const protobuf = require('../protobuf.js-protobufjs-v7.2.4'); // Load protobuf.js from parent
+const protobuf = require('..'); // Load protobuf.js from parent
 
 // Define a simple proto
 const proto = `

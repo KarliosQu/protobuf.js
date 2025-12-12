@@ -4,7 +4,7 @@ var newSuite  = require("./suite"),
     payload   = require("./data/bench.json");
 
 var protobuf = require("..");
-var rprotobuf = require("../../rprotobuf");
+var rprotobuf = require("../rprotobuf");
 
 // Setup protobuf.js
 var pbjsCls = protobuf.loadSync(require.resolve("./data/bench.proto")).resolveAll().lookup("Test");

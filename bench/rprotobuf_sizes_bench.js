@@ -4,7 +4,7 @@ var newSuite = require("./suite");
 var Long = require("long");
 var rprotobuf;
 try {
-    rprotobuf = require("../../rprotobuf");
+    rprotobuf = require("../rprotobuf");
 } catch (e) {
     console.error("Could not load rprotobuf:", e);
     process.exit(1);

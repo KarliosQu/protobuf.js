@@ -1,5 +1,5 @@
 
-const rust = require("../rprotobuf");
+const rust = require("./rprotobuf");
 
 console.log("rust.Writer:", rust.Writer);
 console.log("Type of rust.Writer:", typeof rust.Writer);

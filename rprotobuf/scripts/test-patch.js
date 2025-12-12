@@ -3,8 +3,8 @@ const path = require('path');
 // rprotobuf is at .../protobuf.js-protobufjs-v7.2.4/rprotobuf
 // source is at .../protobuf.js-protobufjs-v7.2.4/protobuf.js-protobufjs-v7.2.4
 // scripts is at .../protobuf.js-protobufjs-v7.2.4/rprotobuf/scripts
-// So we need to go up 2 levels to get to parent, then down to source.
-const protobufPath = path.resolve(__dirname, '../../protobuf.js-protobufjs-v7.2.4');
+// So we need to go up 2 levels to get to root.
+const protobufPath = path.resolve(__dirname, '../../');
 const rprotobuf = require('../index');
 
 console.log('Patching protobufjs with rprotobuf...');

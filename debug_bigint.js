@@ -1,4 +1,4 @@
-var rprotobuf = require("../rprotobuf");
+var rprotobuf = require("./rprotobuf");
 var { ManagedMessage } = rprotobuf;
 
 try {

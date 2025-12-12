@@ -24,7 +24,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "cd ../protobuf.js-protobufjs-v7.2.4 && node node_modules/tape/bin/tape -r ./lib/tape-adapter -r ../rprotobuf/scripts/test-patch.js tests/*.js tests/node/*.js",
+    "test": "cd .. && node node_modules/tape/bin/tape -r ./lib/tape-adapter -r ./rprotobuf/scripts/test-patch.js tests/*.js tests/node/*.js",
     "prepublishOnly": "napi prepublish -t npm",
     "artifacts": "napi artifacts",
     "version": "napi version"

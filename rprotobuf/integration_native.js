@@ -1,4 +1,4 @@
-const protobuf = require("../protobuf.js-protobufjs-v7.2.4/src/index");
+const protobuf = require("../src/index");
 const { NativeType } = require("./index");
 
 // Cache for Type -> NativeType mapping

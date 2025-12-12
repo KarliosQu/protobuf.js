@@ -466,7 +466,7 @@ Writer._configure = function(BufferWriter_) {
 
 try {
     if (!process.env.DISABLE_RUST) {
-        var rust = require("../../rprotobuf");
+        var rust = require("../rprotobuf");
         if (rust.Writer) {
             var RustWriter = rust.Writer;
             

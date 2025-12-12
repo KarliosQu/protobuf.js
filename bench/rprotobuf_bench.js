@@ -17,7 +17,7 @@ var pbjsStaticCls = require("./data/static_pbjs.js").Test;
 // rprotobuf (NAPI)
 var rprotobuf;
 try {
-    rprotobuf = require("../../rprotobuf");
+    rprotobuf = require("../rprotobuf");
 } catch (e) {
     console.error("Could not load rprotobuf:", e);
     process.exit(1);

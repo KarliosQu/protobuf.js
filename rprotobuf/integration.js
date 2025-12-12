@@ -1,4 +1,4 @@
-const protobuf = require("../protobuf.js-protobufjs-v7.2.4/src/index");
+const protobuf = require("../src/index");
 const adapter = require("./adapter");
 const { ManagedMessage } = require("./index");
 
