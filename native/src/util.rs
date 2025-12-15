@@ -10,26 +10,48 @@ pub fn camel_case(input: String) -> String {
         return input;
     }
     
-    let bytes = input.as_bytes();
     let mut result = String::new();
+    let mut chars = input.chars();
     
     // Keep first character as-is
-    result.push(bytes[0] as char);
+    if let Some(first) = chars.next() {
+        result.push(first);
+    }
     
     // Process remaining characters
-    let mut i = 1;
-    while i < bytes.len() {
-        if bytes[i] == b'_' && i + 1 < bytes.len() {
-            let next_char = bytes[i + 1] as char;
-            if next_char.is_ascii_lowercase() {
-                // Skip underscore and capitalize next lowercase letter
-                result.push(next_char.to_ascii_uppercase());
-                i += 2;
-                continue;
-            }
+    let mut skip_next = false;
+    for ch in chars {
+        if skip_next {
+            skip_next = false;
+            continue;
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        
+        if ch == '_' {
+            skip_next = true;
+        } else {
+            result.push(ch);
+        }
+    }
+    
+    // Now process underscores with lookahead
+    result.clear();
+    let chars: Vec<char> = input.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    
+    result.push(chars[0]);
+    
+    let mut i = 1;
+    while i < chars.len() {
+        if chars[i] == '_' && i + 1 < chars.len() && chars[i + 1].is_ascii_lowercase() {
+            // Skip underscore and capitalize next lowercase letter
+            result.push(chars[i + 1].to_ascii_uppercase());
+            i += 2;
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
     }
     
     result

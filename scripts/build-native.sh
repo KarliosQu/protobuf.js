@@ -97,6 +97,7 @@ echo ""
 
 # Test the binary
 echo "Testing native module..."
+# Return to project root (we're currently in native/ directory)
 cd ..
 if node native/test.js > /dev/null 2>&1; then
     echo -e "${GREEN}✓${NC} Native module test passed!"

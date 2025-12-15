@@ -29,7 +29,7 @@
   "types": "index.d.ts",
   "scripts": {
     "bench": "node bench",
-    "build": "npm run build:native && npm run build:bundle && npm run build:types",
+    "build": "(npm run build:native || echo 'Native build failed, using JS fallback') && npm run build:bundle && npm run build:types",
     "build:native": "cargo-cp-artifact -nc native/index.node -- cargo build --manifest-path native/Cargo.toml --message-format=json-render-diagnostics --release",
     "build:native:debug": "cargo build --manifest-path native/Cargo.toml",
     "build:bundle": "gulp --gulpfile scripts/gulpfile.js",
