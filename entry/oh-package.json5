@@ -1,0 +1,18 @@
+{
+  "license": "BSD License",
+  "devDependencies": {},
+  "author": "",
+  "name": "entry",
+  "description": "example description",
+  "ohos": {
+    "org": "huawei",
+    "directoryLevel": "module",
+    "buildTool": "hvigor"
+  },
+  "main": "",
+  "version": "3.0.1-rc.1",
+  "dependencies": {
+    "@ohos/rprotobuf": "file:../library",
+    "long": "^5.2.1"
+  }
+}

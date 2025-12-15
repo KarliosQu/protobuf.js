@@ -4,21 +4,26 @@
     "products": [
       {
         "name": "default",
-        "signingConfig": "default",
-        "compatibleSdkVersion": "5.0.0(12)",
-        "runtimeOS": "HarmonyOS",
-        "buildOption": {
-          "strictMode": {
-            "caseSensitiveCheck": true
-          }
-        }
+        "compileSdkVersion": 12,
+        "compatibleSdkVersion": 12,
+        "targetSdkVersion": 12,
+        "runtimeOS": "OpenHarmony",
+        "signingConfig": "debug_default"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
       }
     ]
   },
   "modules": [
     {
-      "name": "rprotobuf",
-      "srcPath": "./library",
+      "name": "entry",
+      "srcPath": "./entry",
       "targets": [
         {
           "name": "default",
@@ -27,6 +32,10 @@
           ]
         }
       ]
+    },
+    {
+      "name": "library",
+      "srcPath": "./library"
     }
   ]
 }

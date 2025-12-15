@@ -1,17 +1,17 @@
 {
   "license": "ISC",
-  "devDependencies": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.6"
+  },
   "author": "",
-  "name": "rprotobuf-oh",
-  "description": "High performance Protobuf implementation for OpenHarmony",
+  "name": "protobuf",
+  "description": "Please describe the basic information.",
   "ohos": {
-    "org": "",
+    "org": "huawei",
     "directoryLevel": "project",
     "buildTool": "hvigor"
   },
   "main": "",
-  "version": "1.0.0",
-  "dependencies": {
-    "@ohos/rprotobuf": "file:./library"
-  }
+  "version": "3.0.1-rc.1",
+  "dependencies": {}
 }
