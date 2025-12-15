@@ -1,0 +1,17 @@
+{
+  "license": "ISC",
+  "devDependencies": {},
+  "author": "",
+  "name": "rprotobuf-oh",
+  "description": "High performance Protobuf implementation for OpenHarmony",
+  "ohos": {
+    "org": "",
+    "directoryLevel": "project",
+    "buildTool": "hvigor"
+  },
+  "main": "",
+  "version": "1.0.0",
+  "dependencies": {
+    "@ohos/rprotobuf": "file:./library"
+  }
+}

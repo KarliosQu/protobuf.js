@@ -1,0 +1,13 @@
+{
+  "license": "ISC",
+  "devDependencies": {},
+  "author": "",
+  "name": "@ohos/rprotobuf",
+  "description": "High performance Protobuf implementation",
+  "main": "src/main/ets/index.js",
+  "types": "src/main/ets/index.d.ts",
+  "version": "1.0.0",
+  "dependencies": {
+    "protobufjs": "^7.2.4"
+  }
+}
