@@ -2,47 +2,33 @@ use napi_derive::napi;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Convert camelCase string to snake_case (JavaScript camelCase utility)
+/// Convert snake_case string to camelCase (JavaScript utility)
+/// Mimics: str.substring(0, 1) + str.substring(1).replace(/_([a-z])/g, (_, $1) => $1.toUpperCase())
 #[napi]
 pub fn camel_case(input: String) -> String {
-    let mut result = String::new();
-    let mut first = true;
-    
-    for ch in input.chars() {
-        if ch == '_' {
-            first = false;
-            continue;
-        }
-        
-        if first {
-            result.push(ch);
-            first = false;
-        } else if ch == '_' {
-            // Skip underscore, next char will be uppercased
-        } else {
-            result.push(ch);
-        }
+    if input.is_empty() {
+        return input;
     }
     
-    // Convert snake_case to camelCase
     let bytes = input.as_bytes();
-    result.clear();
-    let mut i = 0;
-    let mut capitalize_next = false;
+    let mut result = String::new();
     
+    // Keep first character as-is
+    result.push(bytes[0] as char);
+    
+    // Process remaining characters
+    let mut i = 1;
     while i < bytes.len() {
-        if bytes[i] == b'_' {
-            capitalize_next = true;
-        } else {
-            if i == 0 {
-                result.push(bytes[i] as char);
-            } else if capitalize_next {
-                result.push((bytes[i] as char).to_ascii_uppercase());
-                capitalize_next = false;
-            } else {
-                result.push(bytes[i] as char);
+        if bytes[i] == b'_' && i + 1 < bytes.len() {
+            let next_char = bytes[i + 1] as char;
+            if next_char.is_ascii_lowercase() {
+                // Skip underscore and capitalize next lowercase letter
+                result.push(next_char.to_ascii_uppercase());
+                i += 2;
+                continue;
             }
         }
+        result.push(bytes[i] as char);
         i += 1;
     }
     
