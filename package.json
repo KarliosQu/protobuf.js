@@ -29,7 +29,9 @@
   "types": "index.d.ts",
   "scripts": {
     "bench": "node bench",
-    "build": "npm run build:bundle && npm run build:types",
+    "build": "npm run build:native && npm run build:bundle && npm run build:types",
+    "build:native": "cargo-cp-artifact -nc native/index.node -- cargo build --manifest-path native/Cargo.toml --message-format=json-render-diagnostics --release",
+    "build:native:debug": "cargo build --manifest-path native/Cargo.toml",
     "build:bundle": "gulp --gulpfile scripts/gulpfile.js",
     "build:types": "node cli/bin/pbts --main --global protobuf --out index.d.ts src/ lib/aspromise/index.js lib/base64/index.js lib/codegen/index.js lib/eventemitter/index.js lib/float/index.js lib/fetch/index.js lib/inquire/index.js lib/path/index.js lib/pool/index.js lib/utf8/index.js",
     "changelog": "node scripts/changelog -w",
@@ -50,6 +52,19 @@
     "test:types": "tsc tests/comp_typescript.ts --lib es2015 --esModuleInterop --strictNullChecks --experimentalDecorators --emitDecoratorMetadata && tsc tests/data/test.js.ts --lib es2015 --esModuleInterop --noEmit --strictNullChecks && tsc tests/data/*.ts --lib es2015 --esModuleInterop --noEmit --strictNullChecks",
     "make": "npm run lint:sources && npm run build && npm run lint:types && node ./scripts/gentests.js && npm test"
   },
+  "napi": {
+    "name": "protobufjs-native",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc"
+      ]
+    }
+  },
   "dependencies": {
     "@protobufjs/aspromise": "^1.1.2",
     "@protobufjs/base64": "^1.1.2",
@@ -65,6 +80,8 @@
     "long": "^5.0.0"
   },
   "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "cargo-cp-artifact": "^0.1.9",
     "benchmark": "^2.1.4",
     "browserify": "^17.0.0",
     "browserify-wrap": "^1.0.2",
