@@ -11,3 +11,12 @@ sandbox/
 .nyc_output
 dist/
 .gitpod.yml
+
+# Rust/Cargo build artifacts
+/target
+native/target/
+*.node
+Cargo.lock
+
+# Added by cargo
+/target
