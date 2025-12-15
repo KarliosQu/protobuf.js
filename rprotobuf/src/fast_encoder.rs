@@ -4,6 +4,7 @@ use napi_derive::napi;
 use std::sync::Mutex;
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 
 // 指令集：告诉 Rust 如何从扁平化数组中取值并编码
 #[derive(Clone, Debug)]
@@ -79,6 +80,7 @@ pub mod fast_encoder {
                     i += 1; // Extra arg
                     Op::Nested(tag, sub_id)
                 },
+                23 => Op::RepeatedInt32(tag),
                 26 => Op::RepeatedBool(tag),
                 27 => Op::RepeatedBoolPacked(tag),
                 // ... others
@@ -232,6 +234,61 @@ fn encode_reverse(buf: &mut [u8], pos: &mut usize, schema: &Schema, numerics: &[
                      let payload_size = end_pos - *pos;
                      write_varint32_reverse(buf, pos, payload_size as u32);
                      write_varint32_reverse(buf, pos, *tag);
+                 }
+            },
+            Op::RepeatedInt32(tag) => {
+                 *n_pos -= 1;
+                 let count = numerics[*n_pos] as usize;
+                 
+                 if count > 512 {
+                     let start = *n_pos - count;
+                     let slice = &numerics[start..*n_pos];
+                     *n_pos -= count;
+                     
+                     let chunks: Vec<(usize, [u8; 15])> = slice.par_iter().map(|&val| {
+                         let mut buffer = [0u8; 15];
+                         let mut len = 0;
+                         let v = val as i32;
+                         
+                         // Tag
+                         let mut t = *tag;
+                         while t >= 128 {
+                             buffer[len] = (t & 127) as u8 | 128;
+                             len += 1;
+                             t >>= 7;
+                         }
+                         buffer[len] = t as u8;
+                         len += 1;
+                         
+                         // Value
+                         let mut u = if v < 0 { v as i64 as u64 } else { v as u32 as u64 };
+                         while u >= 128 {
+                             buffer[len] = (u & 127) as u8 | 128;
+                             len += 1;
+                             u >>= 7;
+                         }
+                         buffer[len] = u as u8;
+                         len += 1;
+                         
+                         (len, buffer)
+                     }).collect();
+                     
+                     for (len, chunk) in chunks.iter().rev() {
+                         if *pos < *len { return Err(napi::Error::from_reason("Output buffer too small")); }
+                         *pos -= *len;
+                         buf[*pos..*pos+*len].copy_from_slice(&chunk[0..*len]);
+                     }
+                 } else {
+                     for _ in 0..count {
+                         *n_pos -= 1;
+                         let val = numerics[*n_pos] as i32;
+                         if val < 0 {
+                             write_varint64_reverse(buf, pos, val as i64 as u64);
+                         } else {
+                             write_varint32_reverse(buf, pos, val as u32);
+                         }
+                         write_varint32_reverse(buf, pos, *tag);
+                     }
                  }
             },
             _ => {}

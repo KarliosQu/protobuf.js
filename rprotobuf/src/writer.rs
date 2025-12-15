@@ -1,148 +1,126 @@
 use napi::bindgen_prelude::*;
 use napi::{JsUnknown, JsObject, ValueType, JsFunction, Env, JsBuffer};
 use napi_derive::napi;
+use crate::pool::{PooledBuffer, BUFFER_POOL};
 
 #[napi]
 pub struct Writer {
-    stack: Vec<Vec<u8>>,
+    stack: Vec<PooledBuffer>,
 }
 
 #[napi]
 impl Writer {
     #[napi(constructor)]
     pub fn new() -> Self {
-        Self {
-            stack: vec![Vec::with_capacity(1024)],
+        Writer {
+            stack: vec![BUFFER_POOL.acquire(1024)],
         }
     }
 
     fn current(&mut self) -> &mut Vec<u8> {
-        if self.stack.is_empty() {
-            self.stack.push(Vec::new());
-        }
-        self.stack.last_mut().unwrap()
+        self.stack.last_mut().unwrap().as_mut_vec()
     }
 
     #[napi]
-    pub fn uint32(&mut self, value: u32) -> &Self {
+    pub fn uint32(&mut self, value: u32) {
         let buf = self.current();
-        write_varint32(buf, value);
-        self
+        write_varint32_fast(buf, value);
     }
 
     #[napi]
-    pub fn int32(&mut self, value: i32) -> &Self {
+    pub fn int32(&mut self, value: i32) {
         let buf = self.current();
-        write_varint64(buf, value as i64 as u64);
-        self
+        write_varint64_fast(buf, value as i64 as u64);
     }
 
     #[napi]
-    pub fn sint32(&mut self, value: i32) -> &Self {
-        self.uint32(((value << 1) ^ (value >> 31)) as u32)
+    pub fn sint32(&mut self, value: i32) {
+        self.uint32(((value << 1) ^ (value >> 31)) as u32);
     }
 
     #[napi]
-    pub fn bool(&mut self, value: bool) -> &Self {
+    pub fn bool(&mut self, value: bool) {
         let buf = self.current();
         buf.push(if value { 1 } else { 0 });
-        self
     }
 
     #[napi]
-    pub fn fixed32(&mut self, value: u32) -> &Self {
+    pub fn fixed32(&mut self, value: u32) {
         let buf = self.current();
         buf.extend_from_slice(&value.to_le_bytes());
-        self
     }
 
     #[napi]
-    pub fn sfixed32(&mut self, value: i32) -> &Self {
-        self.fixed32(value as u32)
+    pub fn sfixed32(&mut self, value: i32) {
+        self.fixed32(value as u32);
     }
 
     #[napi]
-    pub fn float(&mut self, value: f64) -> &Self {
+    pub fn float(&mut self, value: f64) {
         let val = value as f32;
-        self.fixed32(val.to_bits())
+        self.fixed32(val.to_bits());
     }
 
     #[napi]
-    pub fn double(&mut self, value: f64) -> &Self {
+    pub fn double(&mut self, value: f64) {
         let buf = self.current();
         buf.extend_from_slice(&value.to_le_bytes());
-        self
     }
 
     #[napi]
-    pub fn string(&mut self, value: String) -> &Self {
+    pub fn string(&mut self, value: String) {
         let buf = self.current();
         let bytes = value.as_bytes();
-        write_varint32(buf, bytes.len() as u32);
+        write_varint32_fast(buf, bytes.len() as u32);
         buf.extend_from_slice(bytes);
-        self
     }
 
     #[napi]
-    pub fn bytes(&mut self, env: Env, value: JsUnknown) -> napi::Result<&Self> {
+    pub fn bytes(&mut self, value: Buffer) {
         let buf = self.current();
-        let global = env.get_global()?;
-        let buffer_ctor: JsFunction = global.get_named_property("Buffer")?;
-        
-        let type_of = value.get_type()?;
-        let buffer_res: JsObject = if type_of == ValueType::String {
-             let args = vec![value, env.create_string("base64")?.into_unknown()];
-             buffer_ctor.call(None, &args)?.try_into()?
-        } else {
-             buffer_ctor.call(None, &[value])?.try_into()?
-        };
-        
-        let len: u32 = buffer_res.get_named_property("length")?;
-        if len == 0 {
-             write_varint32(buf, 0);
-        } else {
-             let js_buf: JsBuffer = buffer_res.into_unknown().try_into()?;
-             let bytes = js_buf.into_value()?;
-             write_varint32(buf, bytes.len() as u32);
-             buf.extend_from_slice(&bytes);
-        }
-        Ok(self)
+        let bytes = value.as_ref();
+        write_varint32_fast(buf, bytes.len() as u32);
+        buf.extend_from_slice(bytes);
     }
 
     #[napi]
-    pub fn raw(&mut self, value: Buffer) -> &Self {
+    pub fn raw(&mut self, value: Buffer) {
         let buf = self.current();
         buf.extend_from_slice(value.as_ref());
-        self
     }
 
     #[napi]
-    pub fn fork(&mut self) -> &Self {
-        self.stack.push(Vec::new());
-        self
+    pub fn fork(&mut self) {
+        self.stack.push(BUFFER_POOL.acquire(1024));
     }
 
     #[napi]
-    pub fn ldelim(&mut self) -> &Self {
-        let child = self.stack.pop().expect("No active fork");
+    pub fn ldelim(&mut self) {
+        if self.stack.len() < 2 {
+            return;
+        }
+        let child = self.stack.pop().unwrap();
         let parent = self.current();
-        write_varint32(parent, child.len() as u32);
-        parent.extend_from_slice(&child);
-        self
+        write_varint32_fast(parent, child.len() as u32);
+        parent.extend_from_slice(child.as_slice());
     }
 
     #[napi]
-    pub fn reset(&mut self) -> &Self {
-        self.stack.clear();
-        self.stack.push(Vec::new());
-        self
+    pub fn reset(&mut self) {
+        self.stack.truncate(1);
+        if !self.stack.is_empty() {
+            self.stack[0].as_mut_vec().clear();
+        } else {
+            self.stack.push(BUFFER_POOL.acquire(1024));
+        }
     }
 
     #[napi]
-    pub fn finish(&mut self) -> Buffer {
-        let buf = self.stack.pop().unwrap_or_default();
-        self.stack.push(Vec::new());
-        buf.into()
+    pub fn finish(&mut self, env: Env) -> Result<JsUnknown> {
+        if self.stack.is_empty() {
+             return Err(Error::from_reason("Stack empty"));
+        }
+        env.create_buffer_copy(self.stack[0].as_slice()).map(|b| b.into_unknown())
     }
 
     #[napi(getter)]
@@ -151,44 +129,44 @@ impl Writer {
     }
     
     #[napi]
-    pub fn uint64(&mut self, value: JsUnknown) -> napi::Result<&Self> {
+    pub fn uint64(&mut self, value: JsUnknown) -> napi::Result<()> {
         let val = extract_u64(value)?;
         let buf = self.current();
-        write_varint64(buf, val);
-        Ok(self)
+        write_varint64_fast(buf, val);
+        Ok(())
     }
 
     #[napi]
-    pub fn int64(&mut self, value: JsUnknown) -> napi::Result<&Self> {
+    pub fn int64(&mut self, value: JsUnknown) -> napi::Result<()> {
         let val = extract_i64(value)?;
         let buf = self.current();
-        write_varint64(buf, val as u64);
-        Ok(self)
+        write_varint64_fast(buf, val as u64);
+        Ok(())
     }
 
     #[napi]
-    pub fn sint64(&mut self, value: JsUnknown) -> napi::Result<&Self> {
+    pub fn sint64(&mut self, value: JsUnknown) -> napi::Result<()> {
         let val = extract_i64(value)?;
         let encoded = (val << 1) ^ (val >> 63);
         let buf = self.current();
-        write_varint64(buf, encoded as u64);
-        Ok(self)
+        write_varint64_fast(buf, encoded as u64);
+        Ok(())
     }
 
     #[napi]
-    pub fn fixed64(&mut self, value: JsUnknown) -> napi::Result<&Self> {
+    pub fn fixed64(&mut self, value: JsUnknown) -> napi::Result<()> {
         let val = extract_u64(value)?;
         let buf = self.current();
         buf.extend_from_slice(&val.to_le_bytes());
-        Ok(self)
+        Ok(())
     }
 
     #[napi]
-    pub fn sfixed64(&mut self, value: JsUnknown) -> napi::Result<&Self> {
+    pub fn sfixed64(&mut self, value: JsUnknown) -> napi::Result<()> {
         let val = extract_i64(value)?;
         let buf = self.current();
         buf.extend_from_slice(&val.to_le_bytes());
-        Ok(self)
+        Ok(())
     }
 
     #[napi]
@@ -197,20 +175,11 @@ impl Writer {
     }
 }
 
-fn write_varint32(buf: &mut Vec<u8>, mut value: u32) {
-    while value > 0x7F {
-        buf.push((value as u8 & 0x7F) | 0x80);
-        value >>= 7;
-    }
-    buf.push(value as u8);
-}
-
-fn write_varint64(buf: &mut Vec<u8>, mut value: u64) {
-    while value > 0x7F {
-        buf.push((value as u8 & 0x7F) | 0x80);
-        value >>= 7;
-    }
-    buf.push(value as u8);
+#[napi]
+pub fn encode_varint(value: u32) -> Buffer {
+    let mut buf = Vec::with_capacity(5);
+    write_varint32_fast(&mut buf, value);
+    buf.into()
 }
 
 #[inline(always)]

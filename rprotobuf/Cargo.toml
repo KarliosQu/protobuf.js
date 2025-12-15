@@ -13,6 +13,8 @@ bytes = "1.5"
 thiserror = "1.0"
 rustc-hash = "1.1"
 once_cell = "1.21.3"
+rayon = "1.8"
+parking_lot = "0.12"
 
 [build-dependencies]
 napi-build = "2.1"

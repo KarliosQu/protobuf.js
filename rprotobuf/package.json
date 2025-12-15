@@ -1,7 +1,7 @@
 {
   "name": "protobufjs-napi",
   "version": "0.1.0",
-  "main": "index.js",
+  "main": "writer_wrapper.js",
   "types": "index.d.ts",
   "napi": {
     "name": "protobufjs-napi",

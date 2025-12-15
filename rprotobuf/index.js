@@ -310,9 +310,10 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Writer, Reader, NativeMessage, NativeType, ManagedMessage, fast_encoder } = nativeBinding
+const { Writer, encodeVarint, Reader, NativeMessage, NativeType, ManagedMessage, fast_encoder } = nativeBinding
 
 module.exports.Writer = Writer
+module.exports.encodeVarint = encodeVarint
 module.exports.Reader = Reader
 module.exports.NativeMessage = NativeMessage
 module.exports.NativeType = NativeType
