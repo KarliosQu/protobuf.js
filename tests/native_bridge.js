@@ -73,7 +73,7 @@ tape.test("native bridge utilities", function(test) {
         var arr2 = ["key1", "value1", "key2", undefined, "key3", "value3"];
         var obj2 = nativeBridge.toObject(arr2);
         test.equal(obj2.key1, "value1", "should include defined values");
-        test.equal(obj2.key2, undefined, "should omit undefined values");
+        test.ok(!obj2.hasOwnProperty("key2"), "should omit undefined values");
         test.equal(obj2.key3, "value3", "should continue after undefined");
         
         test.deepEqual(nativeBridge.toObject([]), {}, "should handle empty array");

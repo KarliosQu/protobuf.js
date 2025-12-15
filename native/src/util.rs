@@ -48,8 +48,13 @@ pub fn uc_first(input: String) -> String {
 /// Check if a name is a reserved JavaScript keyword
 #[napi]
 pub fn is_reserved(name: String) -> bool {
+    is_reserved_str(name.as_str())
+}
+
+/// Internal function to check reserved keywords (takes string slice)
+fn is_reserved_str(name: &str) -> bool {
     matches!(
-        name.as_str(),
+        name,
         "do" | "if" | "in" | "for" | "let" | "new" | "try" | "var" | "case" | "else" | "enum" |
         "eval" | "false" | "null" | "this" | "true" | "void" | "with" | "break" | "catch" |
         "class" | "const" | "super" | "throw" | "while" | "yield" | "delete" | "export" |
@@ -63,7 +68,7 @@ pub fn is_reserved(name: String) -> bool {
 #[napi]
 pub fn safe_prop(prop: String) -> String {
     let is_safe = prop.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-        && !is_reserved(prop.clone());
+        && !is_reserved_str(&prop);
     
     if is_safe && !prop.is_empty() {
         format!(".{}", prop)
@@ -78,7 +83,7 @@ pub fn to_array(obj: HashMap<String, Value>) -> Vec<Value> {
     obj.into_values().collect()
 }
 
-/// Convert array of alternating keys and values to an object, omitting undefined
+/// Convert array of alternating keys and values to an object, omitting undefined and null
 #[napi]
 pub fn to_object(array: Vec<Value>) -> HashMap<String, Value> {
     let mut result = HashMap::new();
@@ -86,6 +91,7 @@ pub fn to_object(array: Vec<Value>) -> HashMap<String, Value> {
     
     while i + 1 < array.len() {
         if let Some(key) = array[i].as_str() {
+            // Only insert if value is not null or undefined
             if !array[i + 1].is_null() {
                 result.insert(key.to_string(), array[i + 1].clone());
             }
