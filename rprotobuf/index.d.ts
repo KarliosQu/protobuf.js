@@ -69,6 +69,7 @@ export declare class NativeMessage {
 }
 export declare class NativeType {
   constructor()
+  decode(buffer: Buffer): object
   encodeHybrid(ops: Int32Array, refs: object): Buffer
   addField(name: string, id: number, fieldType: string, repeated: boolean, required: boolean, isMap: boolean, keyType?: string | undefined | null, nested?: NativeType | undefined | null, oneofName?: string | undefined | null): void
   encode(obj: object): Buffer
@@ -131,10 +132,12 @@ export declare class ManagedMessage {
   getBoolArray(id: number): Array<boolean> | null
   getStringArray(id: number): Array<string> | null
   getBytesArray(id: number): Array<Buffer> | null
-  getPackedInt32(id: number): Array<number> | null
-  getPackedUint32(id: number): Array<number> | null
-  getPackedInt64(id: number): Array<bigint> | null
-  getPackedUint64(id: number): Array<bigint> | null
+  getPackedFloat(id: number): JsTypedArray | null
+  getPackedDouble(id: number): JsTypedArray | null
+  getPackedInt32(id: number): JsTypedArray | null
+  getPackedUint32(id: number): JsTypedArray | null
+  getPackedInt64(id: number): JsTypedArray | null
+  getPackedUint64(id: number): JsTypedArray | null
   getPackedSint64(id: number): Array<bigint> | null
   getPackedBool(id: number): Array<boolean> | null
   setPackedInt32(id: number, value: Array<number>): void

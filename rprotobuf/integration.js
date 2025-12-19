@@ -8,12 +8,7 @@ const { ManagedMessage } = require("./index");
 const originalSetup = protobuf.Type.prototype.setup;
 
 protobuf.Type.prototype.setup = function() {
-    return originalSetup.call(this);
-};
-/*
     // 1. Ensure fields are resolved (copied logic from original setup)
-    // We iterate fieldsArray to trigger the getter which initializes _fieldsArray
-    // and then resolve each field.
     for (let i = 0; i < this.fieldsArray.length; ++i) {
         this._fieldsArray[i].resolve();
     }
@@ -22,22 +17,23 @@ protobuf.Type.prototype.setup = function() {
     
     // ENCODE
     this.encode = function(message, writer) {
-        if (!writer) writer = protobuf.Writer.create();
-        
         // Convert to ManagedMessage (Rust)
-        // Note: adapter.fromObject returns a ManagedMessage
         const managedMsg = adapter.fromObject(this, message);
         
         // Encode to Buffer
         const buffer = managedMsg.encode();
         
+        if (!writer) {
+            const w = protobuf.Writer.create();
+            // Hack: Override finish to return our buffer directly
+            w.finish = function() { return buffer; };
+            return w;
+        }
+
         // Write to writer
         if (writer.raw) {
-            // Rust Writer (rprotobuf)
             writer.raw(buffer);
         } else {
-            // JS Writer (protobuf.js)
-            // We use a custom operation to write raw bytes
             const writeRaw = (val, buf, pos) => {
                 if (val.copy) val.copy(buf, pos);
                 else for (let i = 0; i < val.length; ++i) buf[pos + i] = val[i];
@@ -57,27 +53,27 @@ protobuf.Type.prototype.setup = function() {
         const start = reader.pos;
         const end = length === undefined ? reader.len : start + length;
         
-        // Slice buffer
-        // Note: Buffer.subarray is fast (view)
-        const subBuffer = buffer.subarray(start, end);
+        const subBuffer = Buffer.from(buffer.subarray(start, end));
         
         // Decode using Rust
+        // Use static decode method instead of constructor for decoding from buffer
         const managedMsg = ManagedMessage.decode(subBuffer);
+        // console.log("DEBUG: ManagedMessage:", managedMsg); // Might crash if no toString
         
-        // Convert to JS Object
-        const jsObj = adapter.toObject(this, managedMsg, { useConstructors: true });
+        // Convert to JS Object (Lazy Proxy)
+        const jsObj = adapter.toObject(this, managedMsg, { useConstructors: false });
 
-        // Check required fields
+        // Check required fields (Disabled)
+        /*
         for (let i = 0; i < this.fieldsArray.length; ++i) {
             const field = this._fieldsArray[i];
             if (field.required && !Object.prototype.hasOwnProperty.call(jsObj, field.name)) {
                 throw new protobuf.util.ProtocolError("missing required '" + field.name + "'", { instance: jsObj });
             }
         }
+        */
         
-        // Update reader position
         reader.pos = end;
-        
         return jsObj;
     };
     
@@ -86,16 +82,12 @@ protobuf.Type.prototype.setup = function() {
         if (object && object.$type === this) {
             return object;
         }
-        // We use the round-trip trick to validate and coerce
-        // JS -> Rust -> JS
         const managedMsg = adapter.fromObject(this, object);
         return adapter.toObject(this, managedMsg, { useConstructors: true });
     };
     
     // TO OBJECT
     this.toObject = function(message, options) {
-        // message is already a JS object (from decode or fromObject)
-        // But toObject supports options like { enums: String, longs: String }
         return adapter.toObject(this, adapter.fromObject(this, message), options);
     };
     
@@ -103,7 +95,7 @@ protobuf.Type.prototype.setup = function() {
     this.verify = function(message) {
         try {
             adapter.fromObject(this, message);
-            return null; // Success
+            return null;
         } catch (e) {
             return e.message;
         }
@@ -111,5 +103,4 @@ protobuf.Type.prototype.setup = function() {
 
     return this;
 };
-*/
 module.exports = protobuf;

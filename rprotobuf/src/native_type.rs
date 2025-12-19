@@ -1,5 +1,5 @@
 use napi::bindgen_prelude::*;
-use napi::{JsObject, JsUnknown, ValueType, Env, JsBuffer, JsTypedArray, JsFunction, JsString, KeyCollectionMode, KeyFilter, KeyConversion, JsNumber, JsBigInt, JsBoolean};
+use napi::{JsObject, JsUnknown, ValueType, Env, JsBuffer, JsTypedArray, JsFunction, JsString, KeyCollectionMode, KeyFilter, KeyConversion, JsNumber, JsBigInt, JsBoolean, NapiValue, NapiRaw};
 use napi_derive::napi;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -23,6 +23,7 @@ pub struct FieldDef {
 pub struct NativeType {
     fields: Vec<FieldDef>,
     name_to_index: FxHashMap<String, usize>,
+    id_to_index: FxHashMap<u32, usize>,
 }
 
 #[napi]
@@ -32,6 +33,316 @@ impl NativeType {
         Self {
             fields: Vec::new(),
             name_to_index: FxHashMap::default(),
+            id_to_index: FxHashMap::default(),
+        }
+    }
+
+    #[napi]
+    pub fn decode(&self, env: Env, buffer: JsBuffer) -> napi::Result<JsObject> {
+        let buf = buffer.into_value()?;
+        let slice = buf.as_ref();
+        let mut pos = 0;
+        self.decode_message(&env, slice, &mut pos, slice.len())
+    }
+
+    fn decode_message(&self, env: &Env, buf: &[u8], pos: &mut usize, end: usize) -> napi::Result<JsObject> {
+        let mut obj = env.create_object()?;
+        
+        while *pos < end {
+            let tag = read_varint32(buf, pos)?;
+            let field_id = tag >> 3;
+            let wire_type = tag & 7;
+
+            if let Some(&idx) = self.id_to_index.get(&field_id) {
+                let field = &self.fields[idx];
+                
+                // Handle Packed Repeated
+                if field.repeated && wire_type == 2 && is_packable(&field.field_type) {
+                     let len = read_varint32(buf, pos)? as usize;
+                     let end_packed = *pos + len;
+                     
+                     // Optimization: Use TypedArrays for numeric types
+                     match field.field_type.as_str() {
+                         "float" => {
+                             let count = len / 4;
+                             let mut vec = Vec::with_capacity(count);
+                             while *pos < end_packed {
+                                 if *pos + 4 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                                 let bytes: [u8; 4] = buf[*pos..*pos+4].try_into().unwrap();
+                                 *pos += 4;
+                                 vec.push(f32::from_le_bytes(bytes));
+                             }
+                             // Convert Vec<f32> to &[u8] safely
+                             let byte_len = vec.len() * 4;
+                             let ptr = vec.as_ptr() as *const u8;
+                             let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                             let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec())?.into_raw();
+                             let typed_array = array_buffer.into_typedarray(napi::TypedArrayType::Float32, count, 0)?;
+                             obj.set_named_property(&field.name, typed_array)?;
+                         },
+                         "double" => {
+                             let count = len / 8;
+                             let mut vec = Vec::with_capacity(count);
+                             while *pos < end_packed {
+                                 if *pos + 8 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                                 let bytes: [u8; 8] = buf[*pos..*pos+8].try_into().unwrap();
+                                 *pos += 8;
+                                 vec.push(f64::from_le_bytes(bytes));
+                             }
+                             let byte_len = vec.len() * 8;
+                             let ptr = vec.as_ptr() as *const u8;
+                             let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                             let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec())?.into_raw();
+                             let typed_array = array_buffer.into_typedarray(napi::TypedArrayType::Float64, count, 0)?;
+                             obj.set_named_property(&field.name, typed_array)?;
+                         },
+                         "int32" | "sfixed32" => {
+                             let mut vec = Vec::new();
+                             if field.field_type == "sfixed32" {
+                                 while *pos < end_packed {
+                                     if *pos + 4 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                                     let bytes: [u8; 4] = buf[*pos..*pos+4].try_into().unwrap();
+                                     *pos += 4;
+                                     vec.push(i32::from_le_bytes(bytes));
+                                 }
+                             } else {
+                                 // int32 varint
+                                 while *pos < end_packed {
+                                     vec.push(read_varint32(buf, pos)? as i32);
+                                 }
+                             }
+                             let count = vec.len();
+                             let byte_len = vec.len() * 4;
+                             let ptr = vec.as_ptr() as *const u8;
+                             let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                             let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec())?.into_raw();
+                             let typed_array = array_buffer.into_typedarray(napi::TypedArrayType::Int32, count, 0)?;
+                             obj.set_named_property(&field.name, typed_array)?;
+                         },
+                         "uint32" | "fixed32" => {
+                             let mut vec = Vec::new();
+                             if field.field_type == "fixed32" {
+                                 while *pos < end_packed {
+                                     if *pos + 4 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                                     let bytes: [u8; 4] = buf[*pos..*pos+4].try_into().unwrap();
+                                     *pos += 4;
+                                     vec.push(u32::from_le_bytes(bytes));
+                                 }
+                             } else {
+                                 // uint32 varint
+                                 while *pos < end_packed {
+                                     vec.push(read_varint32(buf, pos)?);
+                                 }
+                             }
+                             let count = vec.len();
+                             let byte_len = vec.len() * 4;
+                             let ptr = vec.as_ptr() as *const u8;
+                             let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                             let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec())?.into_raw();
+                             let typed_array = array_buffer.into_typedarray(napi::TypedArrayType::Uint32, count, 0)?;
+                             obj.set_named_property(&field.name, typed_array)?;
+                         },
+                         _ => {
+                             // Fallback for others (bool, int64, etc.)
+                             // Get or create array
+                             let existing: JsUnknown = obj.get_named_property(&field.name)?;
+                             let mut array: JsObject = if existing.is_array()? {
+                                 unsafe { existing.cast() }
+                             } else {
+                                 let arr_obj = env.run_script::<_, JsObject>("[]")?;
+                                 let arr_copy = unsafe { JsObject::from_raw_unchecked(env.raw(), arr_obj.raw()) };
+                                 obj.set_named_property(&field.name, arr_copy)?;
+                                 arr_obj
+                             };
+
+                             let mut arr_len = array.get_array_length()?;
+
+                             while *pos < end_packed {
+                                 let val = self.read_value(env, buf, pos, &field.field_type, field.nested_type.as_deref())?;
+                                 array.set_element(arr_len, val)?;
+                                 arr_len += 1;
+                             }
+                         }
+                     }
+                     continue;
+                }
+
+                let val = if wire_type == 2 && field.field_type == "message" {
+                     // Nested Message
+                     let len = read_varint32(buf, pos)? as usize;
+                     let msg_end = *pos + len;
+                     if let Some(nested) = &field.nested_type {
+                         nested.decode_message(env, buf, pos, msg_end)?.into_unknown()
+                     } else {
+                         skip_field(buf, pos, wire_type)?;
+                         env.get_undefined()?.into_unknown()
+                     }
+                } else {
+                    // Normal Value
+                    self.read_value_with_wire_type(env, buf, pos, &field.field_type, wire_type, field.nested_type.as_deref())?
+                };
+
+                if field.repeated {
+                     let existing: JsUnknown = obj.get_named_property(&field.name)?;
+                     let mut array: JsObject = if existing.is_array()? {
+                         unsafe { existing.cast() }
+                     } else {
+                         let arr = env.create_array(0)?;
+                         obj.set_named_property(&field.name, arr)?;
+                         let ref_arr: JsUnknown = obj.get_named_property(&field.name)?;
+                         unsafe { ref_arr.cast() }
+                     };
+                     let len = array.get_array_length()?;
+                     array.set_element(len, val)?;
+                } else if field.is_map {
+                    let existing: JsUnknown = obj.get_named_property(&field.name)?;
+                    let mut map_obj: JsObject = if existing.get_type()? == ValueType::Object {
+                        unsafe { existing.cast() }
+                    } else {
+                        let m = env.create_object()?;
+                        obj.set_named_property(&field.name, m)?;
+                        let ref_m: JsUnknown = obj.get_named_property(&field.name)?;
+                        unsafe { ref_m.cast() }
+                    };
+                    
+                    if val.get_type()? == ValueType::Object {
+                        let entry_obj: JsObject = unsafe { val.cast() };
+                        let key: JsUnknown = entry_obj.get_named_property("key")?;
+                        let value: JsUnknown = entry_obj.get_named_property("value")?;
+                        map_obj.set_property(key, value)?;
+                    }
+                } else {
+                    obj.set_named_property(&field.name, val)?;
+                }
+
+            } else {
+                skip_field(buf, pos, wire_type)?;
+            }
+        }
+        Ok(obj)
+    }
+
+    fn read_value(&self, env: &Env, buf: &[u8], pos: &mut usize, field_type: &str, nested: Option<&NativeType>) -> napi::Result<JsUnknown> {
+        // Default wire type for packable fields is usually varint or fixed
+        let wire_type = match field_type {
+            "double" | "fixed64" | "sfixed64" => 1,
+            "float" | "fixed32" | "sfixed32" => 5,
+            "string" | "bytes" | "message" => 2,
+            _ => 0,
+        };
+        self.read_value_with_wire_type(env, buf, pos, field_type, wire_type, nested)
+    }
+
+    fn read_value_with_wire_type(&self, env: &Env, buf: &[u8], pos: &mut usize, field_type: &str, wire_type: u32, nested: Option<&NativeType>) -> napi::Result<JsUnknown> {
+        match field_type {
+            "string" => {
+                let len = read_varint32(buf, pos)? as usize;
+                if *pos + len > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                let s_str = std::str::from_utf8(&buf[*pos..*pos+len]).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                let s = env.create_string(s_str)?;
+                *pos += len;
+                Ok(s.into_unknown())
+            },
+            "bytes" => {
+                let len = read_varint32(buf, pos)? as usize;
+                if *pos + len > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                let b = env.create_buffer_copy(&buf[*pos..*pos+len])?;
+                *pos += len;
+                Ok(b.into_unknown())
+            },
+            "uint32" => {
+                let v = read_varint32(buf, pos)?;
+                Ok(env.create_uint32(v)?.into_unknown())
+            },
+            "int32" => {
+                let v = read_varint64(buf, pos)?;
+                Ok(env.create_int32(v as i32)?.into_unknown())
+            },
+            "sint32" => {
+                let v = read_varint32(buf, pos)?;
+                let decoded = ((v >> 1) as i32) ^ (-((v & 1) as i32));
+                Ok(env.create_int32(decoded)?.into_unknown())
+            },
+            "int64" | "sint64" | "uint64" => {
+                let mut v = read_varint64(buf, pos)?;
+                if field_type == "sint64" {
+                    v = ((v >> 1) as i64 ^ -((v & 1) as i64)) as u64;
+                }
+                if v <= 0x1FFFFFFFFFFFFF {
+                    Ok(env.create_double(v as f64)?.into_unknown())
+                } else {
+                    let mut obj = env.create_object()?;
+                    obj.set_named_property("low", env.create_int32(v as i32)?)?;
+                    obj.set_named_property("high", env.create_int32((v >> 32) as i32)?)?;
+                    obj.set_named_property("unsigned", env.get_boolean(field_type == "uint64")?)?;
+                    Ok(obj.into_unknown())
+                }
+            },
+            "bool" => {
+                let v = read_varint32(buf, pos)?;
+                Ok(env.get_boolean(v != 0)?.into_unknown())
+            },
+            "float" => {
+                if *pos + 4 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                let bytes: [u8; 4] = buf[*pos..*pos+4].try_into().unwrap();
+                *pos += 4;
+                let v = f32::from_le_bytes(bytes);
+                Ok(env.create_double(v as f64)?.into_unknown())
+            },
+            "double" => {
+                if *pos + 8 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                let bytes: [u8; 8] = buf[*pos..*pos+8].try_into().unwrap();
+                *pos += 8;
+                let v = f64::from_le_bytes(bytes);
+                Ok(env.create_double(v)?.into_unknown())
+            },
+            "fixed32" => {
+                if *pos + 4 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                let bytes: [u8; 4] = buf[*pos..*pos+4].try_into().unwrap();
+                *pos += 4;
+                let v = u32::from_le_bytes(bytes);
+                Ok(env.create_uint32(v)?.into_unknown())
+            },
+            "sfixed32" => {
+                if *pos + 4 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                let bytes: [u8; 4] = buf[*pos..*pos+4].try_into().unwrap();
+                *pos += 4;
+                let v = i32::from_le_bytes(bytes);
+                Ok(env.create_int32(v)?.into_unknown())
+            },
+            "fixed64" | "sfixed64" => {
+                if *pos + 8 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+                let bytes: [u8; 8] = buf[*pos..*pos+8].try_into().unwrap();
+                *pos += 8;
+                let v = u64::from_le_bytes(bytes);
+                if v <= 0x1FFFFFFFFFFFFF {
+                    Ok(env.create_double(v as f64)?.into_unknown())
+                } else {
+                    let mut obj = env.create_object()?;
+                    obj.set_named_property("low", env.create_int32(v as i32)?)?;
+                    obj.set_named_property("high", env.create_int32((v >> 32) as i32)?)?;
+                    obj.set_named_property("unsigned", env.get_boolean(field_type == "fixed64")?)?;
+                    Ok(obj.into_unknown())
+                }
+            },
+            "message" => {
+                if wire_type == 2 {
+                    let len = read_varint32(buf, pos)? as usize;
+                    let msg_end = *pos + len;
+                    if let Some(n) = nested {
+                        Ok(n.decode_message(env, buf, pos, msg_end)?.into_unknown())
+                    } else {
+                        skip_field(buf, pos, wire_type)?;
+                        Ok(env.get_undefined()?.into_unknown())
+                    }
+                } else {
+                    Ok(env.get_undefined()?.into_unknown())
+                }
+            },
+            "group" => {
+                Ok(env.get_undefined()?.into_unknown())
+            }
+            _ => Ok(env.get_undefined()?.into_unknown()),
         }
     }
 
@@ -155,42 +466,24 @@ impl NativeType {
                     }
                 },
                 4 => { // Message (Ref)
-                    let val: JsObject = refs.get_element(val_or_ref as u32)?;
-                    // We need to encode this sub-message.
-                    // We need its NativeType.
-                    if let Some(nested) = &field.nested_type {
-                        // Recursive call?
-                        // We can't easily recurse `encode_hybrid` because we don't have the ops for the submessage!
-                        // The JS side only generated ops for the TOP level message.
-                        // Unless JS generated ops for the submessage too and put them in `ops`?
-                        // But `ops` is flat.
-                        // If JS generated ops for submessage, it would be inline?
-                        // But we have a Ref to the object.
-                        // This implies we need to traverse the object NOW.
-                        // So we fall back to `encode_inner` (the old way) for submessages!
-                        // This is the "Shallow Hybrid" approach.
-                        let len_idx = buf.len();
-                        write_varint32_fast(&mut buf, 0); // Placeholder for length
-                        
-                        nested.encode_inner(&env, &val, &mut buf)?;
-                        
-                        let msg_len = buf.len() - len_idx - 1;
-                        // Fix length. This is tricky if length > 127.
-                        // We need to move data.
-                        // For PoC, let's just use `encode_inner` which handles length delimiter?
-                        // No, `encode_inner` writes raw fields. It doesn't write length of the message itself.
-                        // So we need to write length.
-                        // To avoid moving data, we can compute size first?
-                        // Or use a temporary buffer for submessage.
-                        let mut sub_buf = Vec::new();
-                        nested.encode_inner(&env, &val, &mut sub_buf)?;
-                        
-                        // Backtrack to overwrite length? No, we wrote 0 (1 byte).
-                        // If sub_buf.len() > 127, we need more bytes.
-                        // So we must pop the placeholder and write correct varint, then sub_buf.
-                        buf.truncate(len_idx);
-                        write_varint32_fast(&mut buf, sub_buf.len() as u32);
-                        buf.extend_from_slice(&sub_buf);
+                    let val: JsUnknown = refs.get_element(val_or_ref as u32)?;
+                    
+                    // Optimization: If val is already a Buffer (pre-encoded), write it directly
+                    if val.is_buffer()? {
+                        let buf_val: JsBuffer = unsafe { val.cast() };
+                        let data = buf_val.into_value()?;
+                        let slice = data.as_ref();
+                        write_varint32_fast(&mut buf, slice.len() as u32);
+                        buf.extend_from_slice(slice);
+                    } else {
+                        // Fallback: Encode object using Schema-Driven approach
+                        let val: JsObject = unsafe { val.cast() };
+                        if let Some(nested) = &field.nested_type {
+                            let mut sub_buf = Vec::new();
+                            nested.encode_inner(&env, &val, &mut sub_buf)?;
+                            write_varint32_fast(&mut buf, sub_buf.len() as u32);
+                            buf.extend_from_slice(&sub_buf);
+                        }
                     }
                 },
                 5 => { // Fixed32 (Immediate)
@@ -259,6 +552,7 @@ impl NativeType {
     #[napi]
     pub fn add_field(&mut self, name: String, id: u32, field_type: String, repeated: bool, required: bool, is_map: bool, key_type: Option<String>, nested: Option<&NativeType>, oneof_name: Option<String>) -> napi::Result<()> {
         self.name_to_index.insert(name.clone(), self.fields.len());
+        self.id_to_index.insert(id, self.fields.len());
         self.fields.push(FieldDef {
             id,
             name,
@@ -627,6 +921,95 @@ impl NativeType {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[inline(always)]
+fn read_varint32(buf: &[u8], pos: &mut usize) -> napi::Result<u32> {
+    let mut result: u32 = 0;
+    let mut shift = 0;
+    loop {
+        if *pos >= buf.len() {
+            return Err(napi::Error::from_reason("Unexpected end of buffer"));
+        }
+        let b = buf[*pos];
+        *pos += 1;
+        result |= ((b & 0x7F) as u32) << shift;
+        if b & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 32 {
+             // Protection against bad varint?
+             // For now, just return what we have or error
+             return Err(napi::Error::from_reason("Varint too long"));
+        }
+    }
+}
+
+#[inline(always)]
+fn read_varint64(buf: &[u8], pos: &mut usize) -> napi::Result<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    loop {
+        if *pos >= buf.len() {
+            return Err(napi::Error::from_reason("Unexpected end of buffer"));
+        }
+        let b = buf[*pos];
+        *pos += 1;
+        result |= ((b & 0x7F) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+             return Err(napi::Error::from_reason("Varint too long"));
+        }
+    }
+}
+
+fn skip_field(buf: &[u8], pos: &mut usize, wire_type: u32) -> napi::Result<()> {
+    match wire_type {
+        0 => { // Varint
+            read_varint64(buf, pos)?;
+        },
+        1 => { // Fixed64
+            if *pos + 8 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+            *pos += 8;
+        },
+        2 => { // Length Delimited
+            let len = read_varint32(buf, pos)? as usize;
+            if *pos + len > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+            *pos += len;
+        },
+        5 => { // Fixed32
+            if *pos + 4 > buf.len() { return Err(napi::Error::from_reason("Buffer overflow")); }
+            *pos += 4;
+        },
+        3 => { // Start Group
+            loop {
+                if *pos >= buf.len() { return Err(napi::Error::from_reason("Unexpected end of buffer in group")); }
+                let tag = read_varint32(buf, pos)?;
+                let wire = tag & 7;
+                if wire == 4 { break; } // End Group
+                skip_field(buf, pos, wire)?;
+            }
+        },
+        4 => { // End Group - should not happen here if logic is correct
+             return Err(napi::Error::from_reason("Unexpected EndGroup tag"));
+        },
+        _ => {
+             return Err(napi::Error::from_reason("Invalid wire type"));
+        }
+    }
+    Ok(())
+}
+
+fn is_packable(field_type: &str) -> bool {
+    match field_type {
+        "double" | "float" | "int32" | "uint32" | "sint32" | "fixed32" | "sfixed32" |
+        "int64" | "uint64" | "sint64" | "fixed64" | "sfixed64" | "bool" | "enum" => true,
+        _ => false
     }
 }
 

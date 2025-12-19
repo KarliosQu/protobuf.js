@@ -11,6 +11,11 @@ message Test {
     int32 id = 2;
     float score = 3;
     repeated int32 values = 4;
+    Nested nested = 5;
+    repeated float scores = 6;
+}
+message Nested {
+    string title = 1;
 }
 `;
 
@@ -21,7 +26,8 @@ const payload = {
     name: "Test Message",
     id: 12345,
     score: 99.9,
-    values: Array.from({length: 100}, (_, i) => i)
+    values: Array.from({length: 100}, (_, i) => i),
+    scores: Array.from({length: 100}, (_, i) => i * 0.5)
 };
 
 // Verify correctness
@@ -29,11 +35,12 @@ const msg = new ManagedMessage();
 msg.setString(1, payload.name);
 msg.setInt32(2, payload.id);
 msg.setFloat(3, payload.score);
-// Repeated fields might need special handling in ManagedMessage, 
-// let's check if it supports them. 
-// Based on previous read, it has setNested, but maybe not setRepeatedInt32 directly?
-// Let's stick to scalar for now to be safe, or check the API.
-// I'll assume basic scalars work.
+msg.setPackedInt32(4, payload.values);
+msg.setPackedFloat(6, payload.scores);
+const nestedMsg = new ManagedMessage();
+nestedMsg.setString(1, "Nested Title");
+msg.setNested(5, nestedMsg);
+
 
 // Benchmark
 const ITERATIONS = 10000;
@@ -60,10 +67,23 @@ const rMsg = new ManagedMessage();
 rMsg.setString(1, payload.name);
 rMsg.setInt32(2, payload.id);
 rMsg.setFloat(3, payload.score);
+rMsg.setPackedInt32(4, payload.values);
+rMsg.setPackedFloat(6, payload.scores);
+const nestedMsg2 = new ManagedMessage();
+nestedMsg2.setString(1, "Nested Title");
+rMsg.setNested(5, nestedMsg2);
 
 const startRPreEncode = process.hrtime.bigint();
 for (let i = 0; i < ITERATIONS; i++) {
-    rMsg.encode();
+    const b = rMsg.encode();
+    if (i===0) {
+        console.log("Rprotobuf encoded buffer length:", b.length);
+        console.log("Rprotobuf encoded buffer hex:", b.subarray(0, 20).toString('hex'));
+        const d = ManagedMessage.decode(b);
+        console.log("Loopback decode has(1)?", d.has(1));
+        console.log("Loopback decode has(4)?", d.has(4));
+        console.log("Loopback decode has(6)?", d.has(6));
+    }
 }
 const endRPreEncode = process.hrtime.bigint();
 const rPreEncodeTime = Number(endRPreEncode - startRPreEncode) / 1e6;
@@ -84,7 +104,11 @@ console.log(`Rprotobuf Encode (Create+Set+Encode): ${rEncodeTime.toFixed(2)}ms, 
 
 
 // 3. Protobuf.js Decode
-const buffer = Test.encode(payload).finish();
+// Use Rprotobuf encoded buffer if Protobuf.js one is suspicious, or just use Rprotobuf one to be safe for Rprotobuf test.
+const buffer = rMsg.encode(); 
+console.log("Buffer length:", buffer.length);
+console.log("Buffer hex:", buffer.subarray(0, 20).toString('hex'));
+
 const startPbDecode = process.hrtime.bigint();
 for (let i = 0; i < ITERATIONS; i++) {
     Test.decode(buffer);
@@ -95,10 +119,24 @@ console.log(`Protobuf.js Decode: ${pbDecodeTime.toFixed(2)}ms, ${(ITERATIONS/pbD
 
 // 4. Rprotobuf Decode
 const startRDecode = process.hrtime.bigint();
+let decodedMsg;
 for (let i = 0; i < ITERATIONS; i++) {
-    ManagedMessage.decode(buffer);
+    decodedMsg = ManagedMessage.decode(buffer);
 }
 const endRDecode = process.hrtime.bigint();
 const rDecodeTime = Number(endRDecode - startRDecode) / 1e6;
 console.log(`Rprotobuf Decode: ${rDecodeTime.toFixed(2)}ms, ${(ITERATIONS/rDecodeTime*1000).toFixed(0)} ops/sec`);
+
+console.log("Decoded has(1)?", decodedMsg.has(1));
+console.log("Decoded has(4)?", decodedMsg.has(4));
+console.log("Decoded has(6)?", decodedMsg.has(6));
+const decodedValues = decodedMsg.getPackedInt32(4);
+console.log("Decoded values type:", decodedValues ? decodedValues.constructor.name : "null");
+console.log("Decoded values length:", decodedValues ? decodedValues.length : 0);
+console.log("Decoded values[0]:", decodedValues ? decodedValues[0] : "N/A");
+
+const decodedScores = decodedMsg.getPackedFloat(6);
+console.log("Decoded scores type:", decodedScores ? decodedScores.constructor.name : "null");
+console.log("Decoded scores length:", decodedScores ? decodedScores.length : 0);
+console.log("Decoded scores[0]:", decodedScores ? decodedScores[0] : "N/A");
 

@@ -1,5 +1,5 @@
 var ManagedMessage = require("./index").ManagedMessage;
-const protobuf = require("../protobuf.js-protobufjs-v7.2.4/src/index");
+const protobuf = require("../src/index");
 
 const TYPE_ID_MAP = {
     "int32": 5,
@@ -164,91 +164,114 @@ function toObject(type, message, options) {
         }
     }
 
-    let object;
+    let target;
     if (options.useConstructors && type.ctor) {
-        object = new type.ctor();
+        target = new type.ctor();
     } else {
-        object = {};
+        target = {};
     }
 
-    for (const field of type.fieldsArray) {
-        if (!field.resolvedType) {
-            try { field.resolve(); } catch (e) {}
-        }
-        let value = getField(message, field, options);
-        
-        // Handle unset values
-        if (value === null || value === undefined) {
-            if (field.repeated && options.arrays) {
-                object[field.name] = [];
-            } else if (field.map && options.objects) {
-                object[field.name] = {};
-            } else if (options.defaults) {
-                let defaultValue = field.defaultValue;
-                if (field.type === "bytes" && !field.repeated && Array.isArray(defaultValue) && defaultValue.length === 0) {
-                     defaultValue = Buffer.alloc(0);
+    return new Proxy(target, {
+        get(target, prop, receiver) {
+            if (Reflect.has(target, prop)) {
+                return Reflect.get(target, prop, receiver);
+            }
+
+            if (prop === 'toJSON') {
+                return function() {
+                    const snapshot = {};
+                    for (const field of type.fieldsArray) {
+                        const val = this[field.name];
+                        if (val !== undefined) {
+                            snapshot[field.name] = val;
+                        }
+                    }
+                    return snapshot;
+                };
+            }
+
+            if (prop === Symbol.for('nodejs.util.inspect.custom')) {
+                 return function() {
+                    const snapshot = {};
+                    for (const field of type.fieldsArray) {
+                        const val = this[field.name];
+                        if (val !== undefined) {
+                            snapshot[field.name] = val;
+                        }
+                    }
+                    return snapshot;
+                };
+            }
+
+            const field = type.fields[prop];
+            if (field) {
+                if (!field.resolvedType) {
+                    try { field.resolve(); } catch (e) {}
                 }
-                // Force plain object for Long defaults to match test expectations
-                if (defaultValue && typeof defaultValue.low === 'number' && typeof defaultValue.high === 'number') {
-                     defaultValue = { low: defaultValue.low, high: defaultValue.high, unsigned: defaultValue.unsigned };
+                
+                let value = getField(message, field, options);
+                
+                if (value === null || value === undefined) {
+                    if (field.repeated && options.arrays) {
+                        value = [];
+                    } else if (field.map && options.objects) {
+                        value = {};
+                    } else if (options.defaults) {
+                        value = field.defaultValue;
+                        if (field.type === "bytes" && !field.repeated && Array.isArray(value) && value.length === 0) {
+                             value = Buffer.alloc(0);
+                        }
+                        if (value && typeof value.low === 'number' && typeof value.high === 'number') {
+                             value = { low: value.low, high: value.high, unsigned: value.unsigned };
+                        }
+                    } else {
+                        return Reflect.get(target, prop, receiver);
+                    }
                 }
-                object[field.name] = defaultValue;
+
+                if (value !== null && value !== undefined) {
+                    if (field.repeated) {
+                        if (Array.isArray(value)) {
+                            value = value.map(item => processValue(item, field, options));
+                        }
+                    } else if (field.map) {
+                        const mapObj = {};
+                        const valueField = {
+                            type: field.type,
+                            resolvedType: field.resolvedType
+                        };
+                        for (const key in value) {
+                            mapObj[key] = processValue(value[key], valueField, options);
+                        }
+                        value = mapObj;
+                    } else {
+                        value = processValue(value, field, options);
+                    }
+                }
+                
+                target[prop] = value;
+                return value;
             }
-            continue;
-        }
 
-        // Value is set (or present in ManagedMessage).
-        if (!options.defaults) {
-             // If field is optional (explicit presence), we should keep it even if it looks like a default
-             if (field.optional && !field.repeated && !field.map) {
-                 object[field.name] = processValue(value, field, options);
-                 continue;
-             }
-
-             let isDefault = false;
-             if (field.repeated) {
-                 if (value.length === 0 && !options.arrays) isDefault = true;
-             } else if (field.map) {
-                 if (Object.keys(value).length === 0 && !options.objects) isDefault = true;
-             } else {
-                 // Scalar
-                 if (field.type === 'string' && value === "") isDefault = true;
-                 else if (field.type === 'bool' && value === false) isDefault = true;
-                 else if (field.type === 'bytes' && value.length === 0) {
-                     // Keep explicitly set empty bytes
-                     isDefault = false;
-                 }
-                 else if ((field.type === 'int32' || field.type === 'uint32' || 
-                      field.type === 'float' || field.type === 'double' || 
-                      field.type === 'fixed32' || field.type === 'sfixed32' ||
-                      field.type === 'sint32') && value === 0) isDefault = true;
-                 else if (field.resolvedType && field.resolvedType.constructor.name === "Enum" && value === field.defaultValue) isDefault = true;
-                 else if (typeof value === 'bigint' && value === 0n) isDefault = true;
-             }
-             
-
-             if (isDefault) continue;
-        }
-
-        if (field.repeated) {
-            if (Array.isArray(value)) {
-                object[field.name] = value.map(item => processValue(item, field, options));
+            return Reflect.get(target, prop, receiver);
+        },
+        ownKeys(target) {
+            return Array.from(new Set([...Reflect.ownKeys(target), ...Object.keys(type.fields)]));
+        },
+        getOwnPropertyDescriptor(target, prop) {
+            const desc = Reflect.getOwnPropertyDescriptor(target, prop);
+            if (desc) return desc;
+            const field = type.fields[prop];
+            if (field) {
+                return {
+                    configurable: true,
+                    enumerable: true,
+                    writable: true
+                };
             }
-        } else if (field.map) {
-            const mapObj = {};
-            const valueField = {
-                type: field.type,
-                resolvedType: field.resolvedType
-            };
-            for (const key in value) {
-                mapObj[key] = processValue(value[key], valueField, options);
-            }
-            object[field.name] = mapObj;
-        } else {
-            object[field.name] = processValue(value, field, options);
+            return undefined;
         }
-    }
-    return object;
+    });
 }
 
 function toBigInt(val) {

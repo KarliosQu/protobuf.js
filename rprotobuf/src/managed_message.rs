@@ -1,8 +1,8 @@
 use napi::bindgen_prelude::*;
-use napi::{JsBuffer, JsObject, JsString, JsBigInt, JsUnknown, Env, ValueType, NapiRaw};
+use napi::{JsBuffer, JsObject, JsString, JsBigInt, JsUnknown, Env, ValueType, NapiRaw, Ref, JsTypedArray, TypedArrayType};
 use napi_derive::napi;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicI64, Ordering};
 use std::sync::Arc;
 use napi::NapiValue;
 
@@ -148,13 +148,39 @@ pub enum Value {
     Map(Box<FxHashMap<MapKey, Value>>), // map fields - Boxed to reduce enum size
 }
 
-#[napi]
+#[derive(Clone)]
+enum BufferStorage {
+    Owned(Arc<Vec<u8>>),
+    External(Arc<Ref<()>>),
+}
+
+impl std::fmt::Debug for BufferStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(_) => write!(f, "Owned(...)"),
+            Self::External(_) => write!(f, "External(...)"),
+        }
+    }
+}
+
+#[napi(custom_finalize)]
 #[derive(Debug)]
 pub struct ManagedMessage {
     // Map Field ID -> Value
     fields: FxHashMap<u32, Value>,
     cached_size: AtomicUsize,
-    buffer: Option<Arc<Vec<u8>>>,
+    buffer: Option<BufferStorage>,
+    memory_usage: AtomicI64,
+}
+
+impl ObjectFinalize for ManagedMessage {
+    fn finalize(self, mut env: Env) -> napi::Result<()> {
+        let usage = self.memory_usage.load(Ordering::Relaxed);
+        if usage > 0 {
+            env.adjust_external_memory(-usage)?;
+        }
+        Ok(())
+    }
 }
 
 #[napi]
@@ -165,6 +191,34 @@ impl ManagedMessage {
             fields: FxHashMap::default(),
             cached_size: AtomicUsize::new(usize::MAX),
             buffer: None,
+            memory_usage: AtomicI64::new(0),
+        }
+    }
+
+    fn adjust_memory(&self, env: &mut Env, delta: i64) {
+        if delta == 0 { return; }
+        self.memory_usage.fetch_add(delta, Ordering::Relaxed);
+        let _ = env.adjust_external_memory(delta);
+    }
+
+    fn with_buffer_slice<F, R>(&self, env: &Env, start: usize, end: usize, f: F) -> Option<R>
+    where F: FnOnce(&[u8]) -> R {
+        match &self.buffer {
+            Some(BufferStorage::Owned(buf)) => {
+                if end <= buf.len() {
+                    Some(f(&buf[start..end]))
+                } else { None }
+            },
+            Some(BufferStorage::External(arc_ref)) => {
+                if let Ok(buf) = env.get_reference_value::<JsBuffer>(&**arc_ref) {
+                    if let Ok(bytes) = buf.into_value() {
+                        if end <= bytes.len() {
+                            Some(f(&bytes[start..end]))
+                        } else { None }
+                    } else { None }
+                } else { None }
+            },
+            None => None
         }
     }
 
@@ -190,16 +244,21 @@ impl ManagedMessage {
     }
 
     #[napi(factory)]
-    pub fn decode(buffer: JsBuffer) -> napi::Result<Self> {
-        let bytes = buffer.into_value()?.to_vec();
-        Self::decode_from_vec(bytes)
+    pub fn decode(mut env: Env, buffer: JsBuffer) -> napi::Result<Self> {
+        let ref_ = env.create_reference(buffer)?;
+        let buf: JsBuffer = env.get_reference_value(&ref_)?;
+        let bytes = buf.into_value()?;
+        let mut decoder = Decoder::new(bytes.as_ref());
+        let mut msg = Self::decode_with_decoder(&mut decoder, 0, Some(&mut env))?;
+        msg.buffer = Some(BufferStorage::External(Arc::new(ref_)));
+        Ok(msg)
     }
 
     fn decode_from_vec(bytes: Vec<u8>) -> napi::Result<Self> {
         let arc_buf = Arc::new(bytes);
         let mut decoder = Decoder::new(&arc_buf);
-        let mut msg = Self::decode_with_decoder(&mut decoder, 0)?;
-        msg.buffer = Some(arc_buf);
+        let mut msg = Self::decode_with_decoder(&mut decoder, 0, None)?;
+        msg.buffer = Some(BufferStorage::Owned(arc_buf));
         Ok(msg)
     }
 
@@ -207,7 +266,7 @@ impl ManagedMessage {
         Self::decode_from_vec(bytes.to_vec())
     }
 
-    fn decode_with_decoder(decoder: &mut Decoder, end_tag: u32) -> napi::Result<Self> {
+    fn decode_with_decoder(decoder: &mut Decoder, end_tag: u32, mut env: Option<&mut Env>) -> napi::Result<Self> {
         let mut msg = ManagedMessage::new();
         
         while !decoder.eof() {
@@ -236,13 +295,59 @@ impl ManagedMessage {
                 },
                 3 => {
                     let group_end_tag = (field_id << 3) | 4;
-                    let group_msg = Self::decode_with_decoder(decoder, group_end_tag)?;
+                    // Pass env recursively? 
+                    // We need to re-borrow env. Option<&mut Env> is Copy? No.
+                    // We can't easily pass mutable reference multiple times in loop.
+                    // But we only use it in one branch.
+                    // However, `env` is moved into `decode_with_decoder`.
+                    // We need to pass `env.as_deref_mut()`?
+                    // Option<&mut Env> doesn't implement Copy.
+                    // We can use `env.as_deref_mut()` if we had `&mut Option<&mut Env>`.
+                    // Or just pass `None` for nested groups for now to avoid borrow checker hell?
+                    // Or better: `decode_with_decoder` takes `&mut Option<&mut Env>`.
+                    
+                    // Let's try passing `None` for nested groups for now.
+                    // Nested groups are rare in proto3.
+                    let group_msg = Self::decode_with_decoder(decoder, group_end_tag, None)?;
                     Value::Group(Box::new(group_msg))
                 },
                 _ => return Err(napi::Error::from_reason(format!("Unknown wire type {}", wire_type))),
             };
             
-            msg.add_value(field_id, value);
+            // We need to re-borrow env for add_value.
+            // Since we are in a loop, we can't move env.
+            // We need `env` to be `&mut Option<&mut Env>` or similar.
+            // But `decode_with_decoder` signature I defined takes `Option<&mut Env>`.
+            // I should change signature to `env: &mut Option<&mut Env>`.
+            
+            // Wait, I can't change signature easily in `replace_string_in_file` if I don't match exactly.
+            // I'll stick to `Option<&mut Env>` but I have to handle the borrow.
+            // Actually, I can't use `env` multiple times if I pass it by value.
+            // So I must change signature to `env: &mut Option<&mut Env>` or just `env: Option<&mut Env>` but reborrow?
+            // You can't reborrow `Option<&mut T>`.
+            
+            // I will change signature to `env: Option<&Env>`? No, I need mut.
+            // I will change signature to `env: &mut Option<&mut Env>`.
+            
+            // Let's try to implement `decode_with_decoder` with `env: &mut Option<&mut Env>`.
+            // But `decode` calls it.
+            
+            // Actually, simpler: `env: Option<&mut Env>` is hard to use in loop.
+            // Pass `env: *mut Env` (unsafe)? No.
+            
+            // How about `env: &mut Env`?
+            // Then `decode_from_vec` cannot call it (no Env).
+            
+            // So I need two versions? `decode_with_decoder` and `decode_with_decoder_with_env`?
+            // Or just pass `env: Option<&mut Env>` where `Option` is passed by value, but `&mut Env` is reborrowed?
+            // You can reborrow `&mut Env`.
+            // But `Option<&mut Env>` consumes the option.
+            
+            // If I have `mut env: Option<&mut Env>`, I can do `env.as_deref_mut()`.
+            // `as_deref_mut` returns `Option<&mut Env>`.
+            // Yes!
+            
+            msg.add_value(env.as_deref_mut(), field_id, value);
         }
         
         if end_tag != 0 {
@@ -252,40 +357,106 @@ impl ManagedMessage {
         Ok(msg)
     }
 
-    fn add_value(&mut self, id: u32, val: Value) {
+    fn add_value(&mut self, mut env: Option<&mut Env>, id: u32, val: Value) {
         use std::collections::hash_map::Entry;
         match self.fields.entry(id) {
             Entry::Occupied(mut entry) => {
                 let existing = entry.get_mut();
                 match (existing, val) {
                     // Optimized RepeatedVarint
-                    (Value::RepeatedVarint(vec), Value::Varint(v)) => vec.push(v),
+                    (Value::RepeatedVarint(vec), Value::Varint(v)) => {
+                        vec.push(v);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, 8);
+                        }
+                    },
                     (Value::Varint(old), Value::Varint(new)) => {
                         *entry.get_mut() = Value::RepeatedVarint(vec![*old, new]);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, 16); // 2 * 8
+                        }
                     },
                     
                     // Optimized RepeatedBit32
-                    (Value::RepeatedBit32(vec), Value::Bit32(v)) => vec.push(v),
+                    (Value::RepeatedBit32(vec), Value::Bit32(v)) => {
+                        vec.push(v);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, 4);
+                        }
+                    },
                     (Value::Bit32(old), Value::Bit32(new)) => {
                         *entry.get_mut() = Value::RepeatedBit32(vec![*old, new]);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, 8); // 2 * 4
+                        }
                     },
 
                     // Optimized RepeatedBit64
-                    (Value::RepeatedBit64(vec), Value::Bit64(v)) => vec.push(v),
+                    (Value::RepeatedBit64(vec), Value::Bit64(v)) => {
+                        vec.push(v);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, 8);
+                        }
+                    },
                     (Value::Bit64(old), Value::Bit64(new)) => {
                         *entry.get_mut() = Value::RepeatedBit64(vec![*old, new]);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, 16); // 2 * 8
+                        }
                     },
 
                     // Fallback to generic Repeated
-                    (Value::Repeated(vec), val) => vec.push(val),
+                    (Value::Repeated(vec), val) => {
+                        // Approximate size of Value. 
+                        // Since Value is an enum, it takes max size of variants.
+                        // It's likely around 32-48 bytes. Let's use 48.
+                        // Plus heap memory if val is Bytes/String/Nested.
+                        // But val is moved into vec.
+                        // If val has heap memory, it's already allocated.
+                        // But we didn't track it when we created `val` in decode loop?
+                        // In decode loop, `val` is created on stack/temp.
+                        // If `val` is Bytes(Vec), the Vec is on heap.
+                        // We need to track that too.
+                        // But `add_value` takes `val`.
+                        // We should track `val`'s heap size + `Value` size.
+                        
+                        // For now, let's just track the `Value` struct size in Vec.
+                        let size = std::mem::size_of::<Value>() as i64;
+                        vec.push(val);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, size);
+                        }
+                    },
                     (old_val, new_val) => {
                         let old = std::mem::replace(old_val, Value::Varint(0));
+                        let size = (std::mem::size_of::<Value>() * 2) as i64;
                         *old_val = Value::Repeated(vec![old, new_val]);
+                        if let Some(e) = &mut env {
+                            self.adjust_memory(e, size);
+                        }
                     }
                 }
             },
             Entry::Vacant(entry) => {
+                // Inserting a new value into HashMap.
+                // HashMap entry overhead + Value size.
+                // Value size is sizeof(Value).
+                // Plus heap memory of val.
+                
+                // If val is Bytes(Vec), we should track Vec size.
+                // In decode loop:
+                // 0 => Value::Varint(...) -> 0 heap
+                // 2 => Value::BytesRef(...) -> 0 heap
+                // 3 => Value::Group(Box<ManagedMessage>) -> Box allocation + ManagedMessage fields.
+                //      ManagedMessage fields are tracked if we pass env to recursive decode.
+                
+                // So we only need to track `Value` size and HashMap overhead.
+                // Let's approximate HashMap entry as 48 bytes + Value size.
+                let size = (48 + std::mem::size_of::<Value>()) as i64;
                 entry.insert(val);
+                if let Some(e) = &mut env {
+                    self.adjust_memory(e, size);
+                }
             }
         }
         self.invalidate_cache();
@@ -389,13 +560,21 @@ impl ManagedMessage {
     }
 
     #[napi]
-    pub fn set_string(&mut self, id: u32, value: String) {
+    pub fn set_string(&mut self, mut env: Env, id: u32, value: String) {
+        let new_size = value.len() as i64;
+        let old_size = if let Some(Value::String(old)) = self.fields.get(&id) {
+            old.len() as i64
+        } else {
+            0
+        };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::String(value));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_bytes(&mut self, env: Env, id: u32, value: JsBuffer) -> napi::Result<()> {
+    pub fn set_bytes(&mut self, mut env: Env, id: u32, value: JsBuffer) -> napi::Result<()> {
         let obj = unsafe { JsObject::from_raw_unchecked(env.raw(), value.raw()) };
         let len: u32 = obj.get_named_property("length")?;
         let vec = if len == 0 {
@@ -403,6 +582,15 @@ impl ManagedMessage {
         } else {
             value.into_value()?.to_vec()
         };
+        
+        let new_size = vec.len() as i64;
+        let old_size = if let Some(Value::Bytes(old)) = self.fields.get(&id) {
+            old.len() as i64
+        } else {
+            0
+        };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::Bytes(vec));
         self.invalidate_cache();
         Ok(())
@@ -542,11 +730,11 @@ impl ManagedMessage {
     #[napi]
     pub fn encode(&self, env: Env) -> napi::Result<JsBuffer> {
         let mut buf = Vec::with_capacity(1024);
-        self.encode_inner(&mut buf);
+        self.encode_inner(&env, &mut buf);
         env.create_buffer_with_data(buf).map(|b| b.into_raw())
     }
 
-    fn encode_inner(&self, buf: &mut Vec<u8>) {
+    fn encode_inner(&self, env: &Env, buf: &mut Vec<u8>) {
         // 简单的遍历编码。
         // 注意：HashMap 迭代顺序是不确定的。Proto 标准允许乱序，但通常建议按 ID 排序。
         // 为了极致性能，我们先不排序（或者在生产中收集 keys 排序）。
@@ -556,11 +744,11 @@ impl ManagedMessage {
 
         for id in keys {
             let val = &self.fields[id];
-            self.encode_field(buf, *id, val);
+            self.encode_field(env, buf, *id, val);
         }
     }
 
-    fn encode_field(&self, buf: &mut Vec<u8>, id: u32, val: &Value) {
+    fn encode_field(&self, env: &Env, buf: &mut Vec<u8>, id: u32, val: &Value) {
         match val {
             Value::Varint(v) => {
                 // WireType 0
@@ -599,13 +787,11 @@ impl ManagedMessage {
                 let tag = (id << 3) | 2;
                 write_varint32_fast(buf, tag);
                 write_varint32_fast(buf, *len);
-                if let Some(buffer) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buffer.len() {
-                        buf.extend_from_slice(&buffer[start..end]);
-                    }
-                }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(env, start, end, |slice| {
+                    buf.extend_from_slice(slice);
+                });
             },
             Value::Nested(msg) => {
                 // WireType 2
@@ -614,14 +800,14 @@ impl ManagedMessage {
                 
                 let size = msg.compute_size_inner();
                 write_varint32_fast(buf, size as u32);
-                msg.encode_inner(buf);
+                msg.encode_inner(env, buf);
             },
             Value::Group(msg) => {
                 // WireType 3 (StartGroup)
                 let tag = (id << 3) | 3;
                 write_varint32_fast(buf, tag);
                 
-                msg.encode_inner(buf);
+                msg.encode_inner(env, buf);
                 
                 // WireType 4 (EndGroup)
                 let end_tag = (id << 3) | 4;
@@ -630,7 +816,7 @@ impl ManagedMessage {
             Value::Repeated(vec) => {
                 // 简化处理：假设非 packed
                 for item in vec {
-                    self.encode_field(buf, id, item);
+                    self.encode_field(env, buf, id, item);
                 }
             },
             Value::PackedVarint(vec) => {
@@ -720,7 +906,7 @@ impl ManagedMessage {
                     write_varint32_fast(buf, entry_size as u32);
                     
                     encode_map_key(buf, 1, k);
-                    self.encode_field(buf, 2, v);
+                    self.encode_field(env, buf, 2, v);
                 }
             }
         }
@@ -926,22 +1112,16 @@ impl ManagedMessage {
     }
 
     #[napi]
-    pub fn get_string(&self, id: u32) -> Option<String> {
+    pub fn get_string(&self, env: Env, id: u32) -> Option<String> {
         self.fields.get(&id).and_then(|v| match v {
             Value::String(s) => Some(s.clone()),
             Value::Bytes(b) => String::from_utf8(b.clone()).ok(),
             Value::StringRef(off, len) | Value::BytesRef(off, len) => {
-                if let Some(buf) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buf.len() {
-                        std::str::from_utf8(&buf[start..end]).ok().map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    std::str::from_utf8(slice).ok().map(|s| s.to_string())
+                }).flatten()
             },
             _ => None,
         })
@@ -952,24 +1132,18 @@ impl ManagedMessage {
         self.fields.get(&id).and_then(|v| match v {
             Value::Bytes(b) => env.create_buffer_with_data(b.clone()).ok().map(|b| b.into_raw()),
             Value::BytesRef(off, len) | Value::StringRef(off, len) => {
-                 if let Some(buf) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buf.len() {
-                        env.create_buffer_with_data(buf[start..end].to_vec()).ok().map(|b| b.into_raw())
-                    } else {
-                        None
-                    }
-                 } else {
-                     None
-                 }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    env.create_buffer_with_data(slice.to_vec()).ok().map(|b| b.into_raw())
+                }).flatten()
             },
             _ => None,
         })
     }
 
     #[napi]
-    pub fn get_nested(&self, id: u32) -> Option<ManagedMessage> {
+    pub fn get_nested(&self, env: Env, id: u32) -> Option<ManagedMessage> {
         self.fields.get(&id).and_then(|v| match v {
             Value::Nested(msg) => Some(*msg.clone()),
             Value::Group(msg) => Some(*msg.clone()),
@@ -977,17 +1151,11 @@ impl ManagedMessage {
                 ManagedMessage::decode_from_bytes(b).ok()
             },
             Value::BytesRef(off, len) => {
-                 if let Some(buf) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buf.len() {
-                        ManagedMessage::decode_from_bytes(&buf[start..end]).ok()
-                    } else {
-                        None
-                    }
-                 } else {
-                     None
-                 }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    ManagedMessage::decode_from_bytes(slice).ok()
+                }).flatten()
             },
             _ => None,
         })
@@ -1012,16 +1180,16 @@ impl ManagedMessage {
                     obj.set_named_property(&key_str, js_val).ok()?;
                 },
                 Value::BytesRef(off, len) => {
-                     if let Some(buf) = &self.buffer {
-                        let start = *off as usize;
-                        let end = start + *len as usize;
-                        if end <= buf.len() {
-                            let (k, v) = parse_map_entry_from_bytes(&buf[start..end], key_type, value_type).ok()?;
-                            let key_str = map_key_to_string(&k);
-                            let js_val = value_to_js(&env, &v).ok()?;
-                            obj.set_named_property(&key_str, js_val).ok()?;
-                        }
-                     }
+                    let start = *off as usize;
+                    let end = start + *len as usize;
+                    
+                    self.with_buffer_slice(&env, start, end, |slice| {
+                        let (k, v) = parse_map_entry_from_bytes(slice, key_type, value_type).ok()?;
+                        let key_str = map_key_to_string(&k);
+                        let js_val = value_to_js(&env, &v).ok()?;
+                        obj.set_named_property(&key_str, js_val).ok()?;
+                        Some(())
+                    });
                 },
                 Value::Repeated(vec) => {
                     for item in vec {
@@ -1033,18 +1201,18 @@ impl ManagedMessage {
                                 }
                             }
                         } else if let Value::BytesRef(off, len) = item {
-                             if let Some(buf) = &self.buffer {
-                                let start = *off as usize;
-                                let end = start + *len as usize;
-                                if end <= buf.len() {
-                                    if let Ok((k, v)) = parse_map_entry_from_bytes(&buf[start..end], key_type, value_type) {
-                                        let key_str = map_key_to_string(&k);
-                                        if let Ok(js_val) = value_to_js(&env, &v) {
-                                            obj.set_named_property(&key_str, js_val).ok()?;
-                                        }
+                            let start = *off as usize;
+                            let end = start + *len as usize;
+                            
+                            self.with_buffer_slice(&env, start, end, |slice| {
+                                if let Ok((k, v)) = parse_map_entry_from_bytes(slice, key_type, value_type) {
+                                    let key_str = map_key_to_string(&k);
+                                    if let Ok(js_val) = value_to_js(&env, &v) {
+                                        obj.set_named_property(&key_str, js_val).ok()?;
                                     }
                                 }
-                             }
+                                Some(())
+                            });
                         }
                     }
                 },
@@ -1055,40 +1223,36 @@ impl ManagedMessage {
     }
 
     #[napi]
-    pub fn get_int32_array(&self, id: u32) -> Option<Vec<i32>> {
+    pub fn get_int32_array(&self, env: Env, id: u32) -> Option<Vec<i32>> {
         self.fields.get(&id).and_then(|v| match v {
             Value::Repeated(vec) => Some(vec.iter().filter_map(|x| if let Value::Varint(i) = x { Some(*i as i32) } else { None }).collect()),
             Value::RepeatedVarint(vec) => Some(vec.iter().map(|x| *x as i32).collect()),
             Value::PackedVarint(vec) => Some(vec.iter().map(|x| *x as i32).collect()),
             Value::Bytes(b) => parse_packed_varints(b).ok().map(|vec| vec.iter().map(|x| *x as i32).collect()),
             Value::BytesRef(off, len) => {
-                 if let Some(buf) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buf.len() {
-                        parse_packed_varints(&buf[start..end]).ok().map(|vec| vec.iter().map(|x| *x as i32).collect())
-                    } else { None }
-                 } else { None }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    parse_packed_varints(slice).ok().map(|vec| vec.iter().map(|x| *x as i32).collect())
+                }).flatten()
             },
             _ => None,
         })
     }
 
     #[napi]
-    pub fn get_uint32_array(&self, id: u32) -> Option<Vec<u32>> {
+    pub fn get_uint32_array(&self, env: Env, id: u32) -> Option<Vec<u32>> {
         self.fields.get(&id).and_then(|v| match v {
             Value::Repeated(vec) => Some(vec.iter().filter_map(|x| if let Value::Varint(i) = x { Some(*i as u32) } else { None }).collect()),
             Value::RepeatedVarint(vec) => Some(vec.iter().map(|x| *x as u32).collect()),
             Value::PackedVarint(vec) => Some(vec.iter().map(|x| *x as u32).collect()),
             Value::Bytes(b) => parse_packed_varints(b).ok().map(|vec| vec.iter().map(|x| *x as u32).collect()),
             Value::BytesRef(off, len) => {
-                 if let Some(buf) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buf.len() {
-                        parse_packed_varints(&buf[start..end]).ok().map(|vec| vec.iter().map(|x| *x as u32).collect())
-                    } else { None }
-                 } else { None }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    parse_packed_varints(slice).ok().map(|vec| vec.iter().map(|x| *x as u32).collect())
+                }).flatten()
             },
             _ => None,
         })
@@ -1119,26 +1283,29 @@ impl ManagedMessage {
     }
 
     #[napi]
-    pub fn get_string_array(&self, id: u32) -> Option<Vec<String>> {
+    pub fn get_string_array(&self, env: Env, id: u32) -> Option<Vec<String>> {
         self.fields.get(&id).and_then(|v| match v {
-            Value::Repeated(vec) => Some(vec.iter().filter_map(|x| match x {
-                Value::String(s) => Some(s.clone()),
-                Value::Bytes(b) => String::from_utf8(b.clone()).ok(),
-                Value::StringRef(off, len) | Value::BytesRef(off, len) => {
-                    if let Some(buf) = &self.buffer {
-                        let start = *off as usize;
-                        let end = start + *len as usize;
-                        if end <= buf.len() {
-                            std::str::from_utf8(&buf[start..end]).ok().map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+            Value::Repeated(vec) => {
+                let mut res = Vec::new();
+                for x in vec {
+                    let s = match x {
+                        Value::String(s) => Some(s.clone()),
+                        Value::Bytes(b) => String::from_utf8(b.clone()).ok(),
+                        Value::StringRef(off, len) | Value::BytesRef(off, len) => {
+                            let start = *off as usize;
+                            let end = start + *len as usize;
+                            self.with_buffer_slice(&env, start, end, |slice| {
+                                std::str::from_utf8(slice).ok().map(|s| s.to_string())
+                            }).flatten()
+                        },
+                        _ => None,
+                    };
+                    if let Some(val) = s {
+                        res.push(val);
                     }
-                },
-                _ => None,
-            }).collect()),
+                }
+                Some(res)
+            },
             _ => None,
         })
     }
@@ -1156,14 +1323,12 @@ impl ManagedMessage {
                             }
                         },
                         Value::BytesRef(off, len) | Value::StringRef(off, len) => {
-                            if let Some(buf) = &self.buffer {
-                                let start = *off as usize;
-                                let end = start + *len as usize;
-                                if end <= buf.len() {
-                                    if let Ok(buf) = env.create_buffer_with_data(buf[start..end].to_vec()) {
-                                        res.push(buf.into_raw());
-                                    }
-                                }
+                            let start = *off as usize;
+                            let end = start + *len as usize;
+                            if let Some(buf) = self.with_buffer_slice(&env, start, end, |slice| {
+                                env.create_buffer_with_data(slice.to_vec()).ok().map(|b| b.into_raw())
+                            }).flatten() {
+                                res.push(buf);
                             }
                         },
                         _ => {}
@@ -1176,70 +1341,198 @@ impl ManagedMessage {
     }
 
     #[napi]
-    pub fn get_packed_int32(&self, id: u32) -> Option<Vec<i32>> {
+    pub fn get_packed_float(&self, env: Env, id: u32) -> Option<JsTypedArray> {
         self.fields.get(&id).and_then(|v| match v {
-            Value::PackedVarint(vec) => Some(vec.iter().map(|x| *x as i32).collect()),
-            Value::RepeatedVarint(vec) => Some(vec.iter().map(|x| *x as i32).collect()),
-            Value::Bytes(b) => parse_packed_varints(b).ok().map(|vec| vec.iter().map(|x| *x as i32).collect()),
+            Value::PackedBit32(vec) | Value::RepeatedBit32(vec) => {
+                let byte_len = vec.len() * 4;
+                let ptr = vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Float32, vec.len(), 0).ok()
+            },
+            Value::Bytes(b) => {
+                let count = b.len() / 4;
+                let array_buffer = env.create_arraybuffer_with_data(b.clone()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Float32, count, 0).ok()
+            },
             Value::BytesRef(off, len) => {
-                 if let Some(buf) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buf.len() {
-                        parse_packed_varints(&buf[start..end]).ok().map(|vec| vec.iter().map(|x| *x as i32).collect())
-                    } else { None }
-                 } else { None }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    let count = slice.len() / 4;
+                    let array_buffer = env.create_arraybuffer_with_data(slice.to_vec()).ok()?.into_raw();
+                    array_buffer.into_typedarray(TypedArrayType::Float32, count, 0).ok()
+                }).flatten()
             },
             _ => None,
         })
     }
 
     #[napi]
-    pub fn get_packed_uint32(&self, id: u32) -> Option<Vec<u32>> {
+    pub fn get_packed_double(&self, env: Env, id: u32) -> Option<JsTypedArray> {
         self.fields.get(&id).and_then(|v| match v {
-            Value::PackedVarint(vec) => Some(vec.iter().map(|x| *x as u32).collect()),
-            Value::RepeatedVarint(vec) => Some(vec.iter().map(|x| *x as u32).collect()),
-            Value::Bytes(b) => parse_packed_varints(b).ok().map(|vec| vec.iter().map(|x| *x as u32).collect()),
+            Value::PackedBit64(vec) | Value::RepeatedBit64(vec) => {
+                let byte_len = vec.len() * 8;
+                let ptr = vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Float64, vec.len(), 0).ok()
+            },
+            Value::Bytes(b) => {
+                let count = b.len() / 8;
+                let array_buffer = env.create_arraybuffer_with_data(b.clone()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Float64, count, 0).ok()
+            },
             Value::BytesRef(off, len) => {
-                 if let Some(buf) = &self.buffer {
-                    let start = *off as usize;
-                    let end = start + *len as usize;
-                    if end <= buf.len() {
-                        parse_packed_varints(&buf[start..end]).ok().map(|vec| vec.iter().map(|x| *x as u32).collect())
-                    } else { None }
-                 } else { None }
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    let count = slice.len() / 8;
+                    let array_buffer = env.create_arraybuffer_with_data(slice.to_vec()).ok()?.into_raw();
+                    array_buffer.into_typedarray(TypedArrayType::Float64, count, 0).ok()
+                }).flatten()
             },
             _ => None,
         })
     }
 
     #[napi]
-    pub fn get_packed_int64(&self, env: Env, id: u32) -> Option<Vec<JsBigInt>> {
+    pub fn get_packed_int32(&self, env: Env, id: u32) -> Option<JsTypedArray> {
         self.fields.get(&id).and_then(|v| match v {
-            Value::PackedVarint(vec) => {
-                let mut res = Vec::new();
-                for item in vec {
-                    if let Ok(big) = env.create_bigint_from_i64(*item as i64) {
-                        res.push(big);
-                    }
-                }
-                Some(res)
+            Value::PackedVarint(vec) | Value::RepeatedVarint(vec) => {
+                let int32_vec: Vec<i32> = vec.iter().map(|x| *x as i32).collect();
+                let byte_len = int32_vec.len() * 4;
+                let ptr = int32_vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Int32, int32_vec.len(), 0).ok()
+            },
+            Value::Bytes(b) => {
+                let vec = parse_packed_varints(b).ok()?;
+                let int32_vec: Vec<i32> = vec.iter().map(|x| *x as i32).collect();
+                let byte_len = int32_vec.len() * 4;
+                let ptr = int32_vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Int32, int32_vec.len(), 0).ok()
+            },
+            Value::BytesRef(off, len) => {
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    let vec = parse_packed_varints(slice).ok()?;
+                    let int32_vec: Vec<i32> = vec.iter().map(|x| *x as i32).collect();
+                    let byte_len = int32_vec.len() * 4;
+                    let ptr = int32_vec.as_ptr() as *const u8;
+                    let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                    let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                    array_buffer.into_typedarray(TypedArrayType::Int32, int32_vec.len(), 0).ok()
+                }).flatten()
             },
             _ => None,
         })
     }
 
     #[napi]
-    pub fn get_packed_uint64(&self, env: Env, id: u32) -> Option<Vec<JsBigInt>> {
+    pub fn get_packed_uint32(&self, env: Env, id: u32) -> Option<JsTypedArray> {
         self.fields.get(&id).and_then(|v| match v {
-            Value::PackedVarint(vec) => {
-                let mut res = Vec::new();
-                for item in vec {
-                    if let Ok(big) = env.create_bigint_from_u64(*item) {
-                        res.push(big);
-                    }
-                }
-                Some(res)
+            Value::PackedVarint(vec) | Value::RepeatedVarint(vec) => {
+                let uint32_vec: Vec<u32> = vec.iter().map(|x| *x as u32).collect();
+                let byte_len = uint32_vec.len() * 4;
+                let ptr = uint32_vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Uint32, uint32_vec.len(), 0).ok()
+            },
+            Value::Bytes(b) => {
+                let vec = parse_packed_varints(b).ok()?;
+                let uint32_vec: Vec<u32> = vec.iter().map(|x| *x as u32).collect();
+                let byte_len = uint32_vec.len() * 4;
+                let ptr = uint32_vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::Uint32, uint32_vec.len(), 0).ok()
+            },
+            Value::BytesRef(off, len) => {
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    let vec = parse_packed_varints(slice).ok()?;
+                    let uint32_vec: Vec<u32> = vec.iter().map(|x| *x as u32).collect();
+                    let byte_len = uint32_vec.len() * 4;
+                    let ptr = uint32_vec.as_ptr() as *const u8;
+                    let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                    let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                    array_buffer.into_typedarray(TypedArrayType::Uint32, uint32_vec.len(), 0).ok()
+                }).flatten()
+            },
+            _ => None,
+        })
+    }
+
+    #[napi]
+    pub fn get_packed_int64(&self, env: Env, id: u32) -> Option<JsTypedArray> {
+        self.fields.get(&id).and_then(|v| match v {
+            Value::PackedVarint(vec) | Value::RepeatedVarint(vec) => {
+                let byte_len = vec.len() * 8;
+                let ptr = vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::BigInt64, vec.len(), 0).ok()
+            },
+            Value::Bytes(b) => {
+                let vec = parse_packed_varints(b).ok()?;
+                let byte_len = vec.len() * 8;
+                let ptr = vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::BigInt64, vec.len(), 0).ok()
+            },
+            Value::BytesRef(off, len) => {
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    let vec = parse_packed_varints(slice).ok()?;
+                    let byte_len = vec.len() * 8;
+                    let ptr = vec.as_ptr() as *const u8;
+                    let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                    let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                    array_buffer.into_typedarray(TypedArrayType::BigInt64, vec.len(), 0).ok()
+                }).flatten()
+            },
+            _ => None,
+        })
+    }
+
+    #[napi]
+    pub fn get_packed_uint64(&self, env: Env, id: u32) -> Option<JsTypedArray> {
+        self.fields.get(&id).and_then(|v| match v {
+            Value::PackedVarint(vec) | Value::RepeatedVarint(vec) => {
+                let byte_len = vec.len() * 8;
+                let ptr = vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::BigUint64, vec.len(), 0).ok()
+            },
+            Value::Bytes(b) => {
+                let vec = parse_packed_varints(b).ok()?;
+                let byte_len = vec.len() * 8;
+                let ptr = vec.as_ptr() as *const u8;
+                let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                array_buffer.into_typedarray(TypedArrayType::BigUint64, vec.len(), 0).ok()
+            },
+            Value::BytesRef(off, len) => {
+                let start = *off as usize;
+                let end = start + *len as usize;
+                self.with_buffer_slice(&env, start, end, |slice| {
+                    let vec = parse_packed_varints(slice).ok()?;
+                    let byte_len = vec.len() * 8;
+                    let ptr = vec.as_ptr() as *const u8;
+                    let byte_slice = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+                    let array_buffer = env.create_arraybuffer_with_data(byte_slice.to_vec()).ok()?.into_raw();
+                    array_buffer.into_typedarray(TypedArrayType::BigUint64, vec.len(), 0).ok()
+                }).flatten()
             },
             _ => None,
         })
@@ -1273,69 +1566,123 @@ impl ManagedMessage {
 
     // --- Packed Setters ---
     #[napi]
-    pub fn set_packed_int32(&mut self, id: u32, value: Vec<i32>) {
+    pub fn set_packed_int32(&mut self, mut env: Env, id: u32, value: Vec<i32>) {
         let v: Vec<u64> = value.into_iter().map(|x| x as i64 as u64).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedVarint(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedVarint(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_uint32(&mut self, id: u32, value: Vec<u32>) {
+    pub fn set_packed_uint32(&mut self, mut env: Env, id: u32, value: Vec<u32>) {
         let v: Vec<u64> = value.into_iter().map(|x| x as u64).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedVarint(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedVarint(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_float(&mut self, id: u32, value: Vec<f64>) {
+    pub fn set_packed_float(&mut self, mut env: Env, id: u32, value: Vec<f64>) {
         let v: Vec<u32> = value.into_iter().map(|x| (x as f32).to_bits()).collect();
+        let new_size = (v.len() * 4) as i64;
+        let old_size = if let Some(Value::PackedBit32(old)) = self.fields.get(&id) {
+            (old.len() * 4) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedBit32(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_double(&mut self, id: u32, value: Vec<f64>) {
+    pub fn set_packed_double(&mut self, mut env: Env, id: u32, value: Vec<f64>) {
         let v: Vec<u64> = value.into_iter().map(|x| x.to_bits()).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedBit64(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedBit64(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_bool(&mut self, id: u32, value: Vec<bool>) {
+    pub fn set_packed_bool(&mut self, mut env: Env, id: u32, value: Vec<bool>) {
         let v: Vec<u64> = value.into_iter().map(|x| if x { 1 } else { 0 }).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedVarint(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedVarint(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_int64(&mut self, id: u32, value: Vec<BigInt>) {
+    pub fn set_packed_int64(&mut self, mut env: Env, id: u32, value: Vec<BigInt>) {
         let v: Vec<u64> = value.into_iter().map(|x| x.get_u64().1).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedVarint(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedVarint(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_uint64(&mut self, id: u32, value: Vec<BigInt>) {
+    pub fn set_packed_uint64(&mut self, mut env: Env, id: u32, value: Vec<BigInt>) {
         let v: Vec<u64> = value.into_iter().map(|x| x.get_u64().1).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedVarint(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedVarint(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_sint32(&mut self, id: u32, value: Vec<i32>) {
+    pub fn set_packed_sint32(&mut self, mut env: Env, id: u32, value: Vec<i32>) {
         let v: Vec<u64> = value.into_iter().map(|x| {
             ((x << 1) ^ (x >> 31)) as u32 as u64
         }).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedVarint(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedVarint(v));
         self.invalidate_cache();
     }
 
     #[napi]
-    pub fn set_packed_sint64(&mut self, id: u32, value: Vec<BigInt>) {
+    pub fn set_packed_sint64(&mut self, mut env: Env, id: u32, value: Vec<BigInt>) {
         let v: Vec<u64> = value.into_iter().map(|x| {
             let n = x.get_i64().0;
             ((n << 1) ^ (n >> 63)) as u64
         }).collect();
+        let new_size = (v.len() * 8) as i64;
+        let old_size = if let Some(Value::PackedVarint(old)) = self.fields.get(&id) {
+            (old.len() * 8) as i64
+        } else { 0 };
+        self.adjust_memory(&mut env, new_size - old_size);
+
         self.fields.insert(id, Value::PackedVarint(v));
         self.invalidate_cache();
     }
@@ -1372,7 +1719,7 @@ impl ManagedMessage {
     }
 
     #[napi]
-    pub fn get_nested_array(&self, id: u32) -> Option<Vec<ManagedMessage>> {
+    pub fn get_nested_array(&self, env: Env, id: u32) -> Option<Vec<ManagedMessage>> {
         self.fields.get(&id).and_then(|v| match v {
             Value::Repeated(vec) => {
                 let mut res = Vec::new();
@@ -1386,15 +1733,13 @@ impl ManagedMessage {
                             }
                         },
                         Value::BytesRef(off, len) | Value::NestedRef(off, len) => {
-                             if let Some(buf) = &self.buffer {
-                                let start = *off as usize;
-                                let end = start + *len as usize;
-                                if end <= buf.len() {
-                                    if let Ok(msg) = ManagedMessage::decode_from_bytes(&buf[start..end]) {
-                                        res.push(msg);
-                                    }
-                                }
-                             }
+                            let start = *off as usize;
+                            let end = start + *len as usize;
+                            if let Some(msg) = self.with_buffer_slice(&env, start, end, |slice| {
+                                ManagedMessage::decode_from_bytes(slice).ok()
+                            }).flatten() {
+                                res.push(msg);
+                            }
                         },
                         _ => {}
                     }
@@ -1628,6 +1973,7 @@ impl Clone for ManagedMessage {
             fields: self.fields.clone(),
             cached_size: AtomicUsize::new(self.cached_size.load(Ordering::Relaxed)),
             buffer: self.buffer.clone(),
+            memory_usage: AtomicI64::new(0),
         }
     }
 }

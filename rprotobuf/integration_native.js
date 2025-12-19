@@ -1,5 +1,4 @@
 const protobuf = require("../src/index");
-console.log("Writer prototype _push:", protobuf.Writer.prototype._push);
 const { NativeType } = require("./index");
 
 // Cache for Type -> NativeType mapping
@@ -137,10 +136,17 @@ protobuf.Type.prototype.setup = function() {
                             } else if (field.resolvedType instanceof protobuf.Type) {
                                 if (field.resolvedType.group) {
                                     ops[opIdx++] = 10;
+                                    ops[opIdx++] = refs.push(v) - 1;
                                 } else {
                                     ops[opIdx++] = 4;
+                                    // Recursive Hybrid Encoding for Repeated Fields
+                                    try {
+                                        const subBuffer = field.resolvedType.encode(v).finish();
+                                        ops[opIdx++] = refs.push(subBuffer) - 1;
+                                    } catch (e) {
+                                        ops[opIdx++] = refs.push(v) - 1;
+                                    }
                                 }
-                                ops[opIdx++] = refs.push(v) - 1;
                             } else if (field.type === "bool") {
                                 ops[opIdx++] = 9;
                                 ops[opIdx++] = v ? 1 : 0;
@@ -177,10 +183,23 @@ protobuf.Type.prototype.setup = function() {
                         } else if (field.resolvedType instanceof protobuf.Type) {
                             if (field.resolvedType.group) {
                                 ops[opIdx++] = 10;
+                                ops[opIdx++] = refs.push(val) - 1;
                             } else {
                                 ops[opIdx++] = 4;
+                                // Recursive Hybrid Encoding!
+                                // If we can encode the sub-message here, we pass a Buffer instead of the object.
+                                // This avoids the slow Schema-Driven encoding in Rust.
+                                try {
+                                    // Note: We need to be careful about infinite recursion if types are recursive.
+                                    // But protobuf.js encode handles this by stack depth usually? 
+                                    // Here we just call encode.
+                                    const subBuffer = field.resolvedType.encode(val).finish();
+                                    ops[opIdx++] = refs.push(subBuffer) - 1;
+                                } catch (e) {
+                                    // Fallback to object if something fails (e.g. circular ref handling issues?)
+                                    ops[opIdx++] = refs.push(val) - 1;
+                                }
                             }
-                            ops[opIdx++] = refs.push(val) - 1;
                         } else if (field.type === "bool") {
                             ops[opIdx++] = 9;
                             ops[opIdx++] = val ? 1 : 0;
@@ -238,6 +257,20 @@ protobuf.Type.prototype.setup = function() {
         }
         
         return writer;
+    };
+
+    const originalDecode = this.decode;
+    this.decode = function(reader, length) {
+        if (reader instanceof Uint8Array) {
+             try {
+                 const native = getOrBuildNativeType(this);
+                 return native.decode(reader);
+             } catch (e) {
+                 // console.warn(`[NativeType] Decode failed for ${this.name}, falling back to JS: ${e.message}`);
+                 return originalDecode.call(this, reader, length);
+             }
+        }
+        return originalDecode.call(this, reader, length);
     };
     
     return result;

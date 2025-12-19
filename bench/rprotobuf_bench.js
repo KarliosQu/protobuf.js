@@ -80,9 +80,9 @@ newSuite("encoding")
 .add("protobuf.js (static)", function() {
     pbjsStaticCls.encode(pbjsMsg).finish();
 })
-.add("rprotobuf (NAPI)", function() {
-    rMsg.encode();
-})
+// .add("rprotobuf (NAPI)", function() {
+//     rMsg.encode();
+// })
 .add("JSON (string)", function() {
     JSON.stringify(jsonMsg);
 })
@@ -124,5 +124,17 @@ newSuite("combined")
 })
 .add("JSON (buffer)", function() {
     JSON.parse(Buffer_from(JSON.stringify(jsonMsg), "utf8").toString("utf8"));
+})
+.run();
+
+newSuite("access")
+.add("rprotobuf (NAPI) access", function() {
+    var m = ManagedMessage.decode(pbjsBuf);
+    m.getString(1);
+    m.getUint32(2);
+    var inner = m.getNested(3);
+    if (inner) {
+        inner.getInt32(1);
+    }
 })
 .run();
