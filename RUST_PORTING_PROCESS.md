@@ -41,3 +41,12 @@
 **移植细节**:
 - 移除了原版中部分未使用的复杂 Ref 逻辑，简化为 `Reader/Writer` 核心。
 - 重新实现了 `write_varint32_fast` 等内联热点函数，确保在各个平台上的极致性能。
+
+### 4.3 JS 适配层与注入 (2026-01-07)
+**操作**:
+- 创建 `rust/index.js`: 标准 N-API Loader。
+- 创建 `rust/integration.js`: 提供 `enable()` 方法，允许将 `protobuf.util` 下的 IO 原语替换为 Rust 实现。
+
+**决策推理**:
+- **分层策略**: 鉴于 `ManagedMessage` 过于复杂，我们采用“自底向上”的策略。优先替换底层的 `Writer` 和 `Reader`。这允许用户在不改变上层 Message 结构的情况下，手动优化热点 IO 路径。
+- **兼容性**: 默认不强制全局替换，而是挂载在 `protobuf.util.RustWriter`，除非设置环境变量 `PROTOBUF_REPLACE_IO`。这也符合迭代开发的稳健原则。
