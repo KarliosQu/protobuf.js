@@ -28,6 +28,7 @@
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {
+    "build:rust": "cd rust && npm install && npm run build",
     "bench": "node bench",
     "build": "npm run build:bundle && npm run build:types",
     "build:bundle": "gulp --gulpfile scripts/gulpfile.js",
