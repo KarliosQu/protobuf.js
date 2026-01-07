@@ -1,8 +1,10 @@
 #![deny(clippy::all)]
 
-use napi_derive::napi;
+extern crate napi_derive;
 
-#[napi]
-pub fn sum(a: i32, b: i32) -> i32 {
-  a + b
-}
+pub mod writer;
+pub mod reader;
+pub mod pool;
+
+pub use writer::Writer;
+pub use reader::Reader;

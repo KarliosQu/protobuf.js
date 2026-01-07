@@ -31,3 +31,13 @@
 
 **决策推理**:
 - **依赖选择**: `bytes` 库是 Rust 生态中处理二进制流的标准库，适合 Protobuf 的 Buffer 操作。`rayon` 用于潜在的并行计算优化。
+
+### 4.2 核心编解码逻辑移植 (2026-01-07)
+**操作**:
+- 移植 `Writer` (writer.rs): 实现零拷贝的 Buffer 写入逻辑，集成内存池 (`pool.rs`) 以减少内存分配开销。
+- 移植 `Reader` (reader.rs): 实现高效的 Varint 解码和 Buffer 读取。
+- 引入内存池 `BufferPool`: 解决高频序列化场景下的内存碎片问题。
+
+**移植细节**:
+- 移除了原版中部分未使用的复杂 Ref 逻辑，简化为 `Reader/Writer` 核心。
+- 重新实现了 `write_varint32_fast` 等内联热点函数，确保在各个平台上的极致性能。
