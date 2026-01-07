@@ -50,3 +50,13 @@
 **决策推理**:
 - **分层策略**: 鉴于 `ManagedMessage` 过于复杂，我们采用“自底向上”的策略。优先替换底层的 `Writer` 和 `Reader`。这允许用户在不改变上层 Message 结构的情况下，手动优化热点 IO 路径。
 - **兼容性**: 默认不强制全局替换，而是挂载在 `protobuf.util.RustWriter`，除非设置环境变量 `PROTOBUF_REPLACE_IO`。这也符合迭代开发的稳健原则。
+
+### 4.4 双模式切换机制 (2026-01-07)
+**操作**:
+- 修改入口文件 `index.js`: 添加环境检测逻辑。
+- 逻辑: 当 `PROTOBUF_USE_RUST=true` 时，自动设置 `PROTOBUF_REPLACE_IO` 并调用 `integration.enable()`。
+- 容错: 使用 `try-catch` 包裹加载逻辑，确保在 Rust 模块未编译（如纯 JS 环境）时不会导致程序崩溃。
+
+**决策推理**:
+- **渐进增强**: 遵循 "Progressive Enhancement" 理念。Rust 扩展被视为增强模块，而非硬性依赖。
+- **环境隔离**: 通过 `process` 对象检测，确保浏览器环境构建时不会引入即刻崩溃的代码（虽然浏览器环境还需配合 bundler 配置 ignore）。
